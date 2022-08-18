@@ -1,0 +1,70 @@
+unset -f __update_repos_comp
+__update_repos_comp () {
+    # echo "ARGS: $@"
+    # echo "COMP_LINE: $COMP_LINE"
+    # echo "COMP_POINT: $COMP_POINT"
+    # echo "COMP_KEY: $COMP_KEY"
+    # echo "COMP_TYPE: $COMP_TYPE"
+    # echo "COMP_WORDS: ${COMP_WORDS[@]}"
+    # echo "COMP_CWORD: $COMP_CWORD (${COMP_WORDS[$COMP_CWORD]})"
+    # COMPREPLY=("what" "lol" "lmao")
+
+    # usage: update-repos [-h] [-d DEPTH] [-e EXCLUDE] [-R] [-1] [-p] [-l] [-s] [-r]
+    #                     [-v | -q] [-t | --no-traceback]
+    #                     [directories [directories ...]]
+
+    # Update git repositories from remotes.
+
+    # positional arguments:
+    # directories           directories to search for repositories (defaults to
+    #                         current directory)
+
+    # optional arguments:
+    # -h, --help            show this help message and exit
+    # -d DEPTH, --depth DEPTH
+    #                         maximum depth to search for repositories
+    # -e EXCLUDE, --exclude EXCLUDE
+    #                         directories to exclude from consideration; may be
+    #                         repeated; accepts wildcards (remember to quote them!)
+    # -R, --force-recurse   recurse into repositories, updating submodules &
+    #                         simple nested repositories
+    # -1, --single-thread   Run in a single thread. useful for background tasks,
+    #                         or debugging.
+    # -p, --print           don't update; print the paths of located repositories
+    # -l, --lprune          If a local branch tracks a remote branch that no
+    #                         longer exists, prune the local branch
+    # -s, --slow            try to avoid ratelimit. implies `--single-thread`
+    # -r, --random-order    randomize the order in which repositories are accessed
+    # -v, --verbose         increase the verbosity of the script (can be specified
+    #                         up to twice)
+    # -q, --quiet           silence all output (cannot be combined with --verbose)
+    # -t, --traceback       display tracebacks on error (defaults to True when
+    #                         verbose >= 2)
+    # --no-traceback        disable tracebacks (even when verbose >= 2)
+
+    local program="$1"
+    local this_word="$2"
+    local last_word="$3"
+
+    # handle options expecting arguments
+    case "$last_word" in
+        (-e|--exclude)
+            # --exclude expects a directory pattern, we'll just offer directories
+            COMPREPLY=($( compgen -d "$this_word" ))
+            return ;;
+        (-d|--depth)
+            # --depth expects a number, but listing out all possible numbers would take too long
+            COMPREPLY=("enter a number..." "")
+            return ;;
+    esac
+
+    # standard completion options
+    COMPREPLY=($( compgen -o plusdirs \
+        -W "-h -d -e -R -1 -p -l -s -r -v -q -t --help --depth --exclude --force-recurse --single-thread --print \
+            --lprune  --slow --random-order --verbose --quiet --traceback --no-traceback" \
+        -- "$this_word"
+    ))
+}
+
+complete -o nosort -F __update_repos_comp update-repos
+complete -o nosort -F __update_repos_comp update_repos.py
