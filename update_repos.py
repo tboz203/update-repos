@@ -235,7 +235,7 @@ def update_branch(repo: git.Repo, branch: git.Head, lprune: bool = False) -> Non
         logger.debug("%s: no changes for branch: %s", repo.working_dir, branch)
     elif checked_out:
         # branch is checked out *somewhere*, but not necessarily here...
-        if repo.head.is_detached or repo.head != branch:
+        if repo.head.is_detached or repo.head.ref != branch:
             # its checked out somewhere else!
             logger.info("%s: skipping branch checked out elsewhere: %s", repo.working_dir, branch)
         elif repo.is_dirty():

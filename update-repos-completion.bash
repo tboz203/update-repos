@@ -1,13 +1,5 @@
 unset -f __update_repos_comp
 __update_repos_comp () {
-    # echo "ARGS: $@"
-    # echo "COMP_LINE: $COMP_LINE"
-    # echo "COMP_POINT: $COMP_POINT"
-    # echo "COMP_KEY: $COMP_KEY"
-    # echo "COMP_TYPE: $COMP_TYPE"
-    # echo "COMP_WORDS: ${COMP_WORDS[@]}"
-    # echo "COMP_CWORD: $COMP_CWORD (${COMP_WORDS[$COMP_CWORD]})"
-    # COMPREPLY=("what" "lol" "lmao")
 
     # usage: update-repos [-h] [-d DEPTH] [-e EXCLUDE] [-R] [-1] [-p] [-l] [-s] [-r]
     #                     [-v | -q] [-t | --no-traceback]
@@ -42,15 +34,14 @@ __update_repos_comp () {
     #                         verbose >= 2)
     # --no-traceback        disable tracebacks (even when verbose >= 2)
 
-    local program="$1"
-    local this_word="$2"
-    local last_word="$3"
+    local cur prev words cword
+    _init_completion || return
 
     # handle options expecting arguments
-    case "$last_word" in
+    case "$prev" in
         (-e|--exclude)
             # --exclude expects a directory pattern, we'll just offer directories
-            COMPREPLY=($( compgen -d "$this_word" ))
+            _filedir -d
             return ;;
         (-d|--depth)
             # --depth expects a number, but listing out all possible numbers would take too long
@@ -59,11 +50,14 @@ __update_repos_comp () {
     esac
 
     # standard completion options
-    COMPREPLY=($( compgen -o plusdirs \
+    COMPREPLY=($( compgen \
         -W "-h -d -e -R -1 -p -l -s -r -v -q -t --help --depth --exclude --force-recurse --single-thread --print \
             --lprune  --slow --random-order --verbose --quiet --traceback --no-traceback" \
-        -- "$this_word"
+        -- "$cur"
     ))
+
+    # plus directories
+    _filedir -d
 }
 
 complete -o nosort -F __update_repos_comp update-repos
