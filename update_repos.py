@@ -36,7 +36,7 @@ LOGGING_CONFIG = {
     "disable_existing_loggers": False,
     "formatters": {
         "verbose": {
-            "format": ("[%(levelname)8s %(asctime)s %(name)s] %(message)s"),
+            "format": ("[%(levelname)8s %(asctime)s %(threadName)s %(name)s] %(message)s"),
             "datefmt": "%Y-%m-%d %H:%M:%S",
         },
     },
@@ -69,6 +69,8 @@ FETCHINFO_FLAGS = {
 
 logging.config.dictConfig(LOGGING_CONFIG)
 logger = logging.getLogger("update-repos")
+
+WalkEntry = Tuple[str, List[str], List[str]]
 
 
 def no_traceback_log_filter(record: logging.LogRecord) -> bool:
@@ -114,7 +116,7 @@ class MyExecutor(ThreadPoolExecutor):
         yield from self._futures
 
 
-def depthwalk(top: str, maxdepth: int = 0, **kwargs) -> Iterator[Tuple[str, List[str], List[str]]]:
+def depthwalk(top: str, maxdepth: int = float('inf'), **kwargs) -> Iterator[WalkEntry]:
     """just like `os.walk`, but with new added `maxdepth` parameter!"""
     depthmap: Dict[str, int] = {top: 0}
     for path, dirs, files in os.walk(top, **kwargs):
@@ -128,8 +130,8 @@ def depthwalk(top: str, maxdepth: int = 0, **kwargs) -> Iterator[Tuple[str, List
             depthmap[child] = here + 1
 
 
-def backwalk(top: str, int=0, **kwargs) -> Iterator[Tuple[str, List[str], List[str]]]:
-    """just like `os.walk`, but goes up instead of down (for compatibility purposes)"""
+def backwalk(top: str) -> Iterator[WalkEntry]:
+    """just like `os.walk`, but goes up instead of down"""
     curr = os.path.abspath(top)
     while True:
         parent = os.path.dirname(curr)
@@ -151,8 +153,10 @@ def find_git_repos(
     randomized: bool = False,
     force_recurse: bool = False,
 ) -> List[str]:
-    """find git repositories beneath a root directory, optionally limiting
-    max depth. (will not return submodules)"""
+    """
+    find git repositories above and beneath a root directory, optionally
+    limiting max depth. (will not return submodules)
+    """
 
     logger.debug("finding git repositories: %s (maxdepth=%s)", root, maxdepth)
 
@@ -218,7 +222,7 @@ def update_branch(repo: git.Repo, branch: git.Head, lprune: bool = False) -> Non
     checked_out = branch_is_checked_out_anywhere(repo, branch)
     tracking_branch = branch.tracking_branch()
     if tracking_branch is None:
-        logger.info("%s: no tracking branch set: %s", repo.working_dir, branch)
+        logger.debug("%s: no tracking branch set: %s", repo.working_dir, branch)
     elif not tracking_branch.is_valid():
         if (not checked_out) and lprune:
             logger.info("%s: Pruning local branch: %s", repo.working_dir, branch)
@@ -242,7 +246,7 @@ def update_branch(repo: git.Repo, branch: git.Head, lprune: bool = False) -> Non
             logger.warning(
                 "%s: Refusing to update checked out branch: local changes would be overwritten: %s",
                 repo.working_dir,
-                branch
+                branch,
             )
         else:
             logger.info("%s: fast-forwarding checked out branch: %s", repo.working_dir, branch)
@@ -269,6 +273,7 @@ def update_repo(path: str, lprune: bool = False) -> bool:
                     fetchinfolist = remote.fetch()
                     break
                 except git.GitCommandError as exc:
+                    logger.error(exc)
                     if time.monotonic() - start > 120:
                         logger.error("caught the thing too many times; giving up")
                         failures = True
@@ -307,10 +312,10 @@ def get_worktrees(repo: git.Repo) -> List[git.Repo]:
     common_dir = Path(repo.common_dir).resolve()
     parent_repo = git.Repo(common_dir.parent)
     known_repos = [parent_repo]
-    worktrees_dir = common_dir.joinpath('worktrees')
+    worktrees_dir = common_dir.joinpath("worktrees")
     if worktrees_dir.exists():
         for child in worktrees_dir.iterdir():
-            gitdir_file = child.joinpath('gitdir')
+            gitdir_file = child.joinpath("gitdir")
             gitdir_path = Path(gitdir_file.read_text().strip())
             child_worktree_repo = git.Repo(gitdir_path.parent)
             known_repos.append(child_worktree_repo)
@@ -329,7 +334,7 @@ def branch_is_checked_out_anywhere(repo: git.Repo, branch: git.Head) -> bool:
     """
 
     # need to know about worktrees, but don't need to recalculate them for every branch
-    if not hasattr(repo, 'worktrees'):
+    if not hasattr(repo, "worktrees"):
         repo.worktrees = get_worktrees(repo)
 
     worktree: git.Repo

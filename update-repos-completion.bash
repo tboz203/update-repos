@@ -49,16 +49,27 @@ __update_repos_comp () {
             return ;;
     esac
 
-    # standard completion options
-    COMPREPLY=($( compgen \
-        -W "-h -d -e -R -1 -p -l -s -r -v -q -t --help --depth --exclude --force-recurse --single-thread --print \
-            --lprune  --slow --random-order --verbose --quiet --traceback --no-traceback" \
-        -- "$cur"
-    ))
+
+    # the full battery of options
+    optional=(
+        -h -d -e -R -1 -p -l -s -r -v -q -t --help --depth --exclude --force-recurse --single-thread --print --lprune
+        --slow --random-order --verbose --quiet --traceback --no-traceback
+    )
+
+    # only included if you're already typing an option
+    if [[ $cur == -* ]]; then
+        COMPREPLY=( $(compgen -W "${optional[*]}" -- "$cur") )
+    fi
 
     # plus directories
     _filedir -d
 }
 
-complete -o nosort -F __update_repos_comp update-repos
-complete -o nosort -F __update_repos_comp update_repos.py
+# the `nosort` option appears to have been added in bash 4.4
+if [[ ${BASH_VERSINFO[0]} -ge 5 || ( ${BASH_VERSINFO[0]} -eq 4 && ${BASH_VERSINFO[1]} -ge 4 ) ]]; then
+    complete -o nosort -F __update_repos_comp update-repos
+    complete -o nosort -F __update_repos_comp update_repos.py
+else
+    complete -F __update_repos_comp update-repos
+    complete -F __update_repos_comp update_repos.py
+fi
