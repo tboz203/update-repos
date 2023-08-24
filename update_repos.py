@@ -35,6 +35,10 @@ LOGGING_CONFIG = {
     "version": 1,
     "disable_existing_loggers": False,
     "formatters": {
+        "standard": {
+            "format": ("[%(levelname)8s %(asctime)s] %(message)s"),
+            "datefmt": "%Y-%m-%d %H:%M:%S",
+        },
         "verbose": {
             "format": ("[%(levelname)8s %(asctime)s %(threadName)s %(name)s] %(message)s"),
             "datefmt": "%Y-%m-%d %H:%M:%S",
@@ -43,7 +47,7 @@ LOGGING_CONFIG = {
     "handlers": {
         "console": {
             "level": "DEBUG",
-            "formatter": "verbose",
+            "formatter": "standard",
             "class": "logging.StreamHandler",
         },
     },
@@ -116,6 +120,15 @@ class MyExecutor(ThreadPoolExecutor):
         yield from self._futures
 
 
+class Repo(git.Repo):
+    """Just like git.Repo, but with `orig_path` attribute"""
+    # i'm tired of my logs being jam packed with absolute paths
+
+    def __init__(self, pathlike, *args, **kwargs):
+        super().__init__(pathlike, *args, **kwargs)
+        self.orig_path = pathlike
+
+
 def depthwalk(top: str, maxdepth: int = float('inf'), **kwargs) -> Iterator[WalkEntry]:
     """just like `os.walk`, but with new added `maxdepth` parameter!"""
     depthmap: Dict[str, int] = {top: 0}
@@ -152,6 +165,7 @@ def find_git_repos(
     exclude: Optional[Iterable[str]] = None,
     randomized: bool = False,
     force_recurse: bool = False,
+    absolute_paths: bool = False,
 ) -> List[str]:
     """
     find git repositories above and beneath a root directory, optionally
@@ -160,7 +174,10 @@ def find_git_repos(
 
     logger.debug("finding git repositories: %s (maxdepth=%s)", root, maxdepth)
 
-    root = os.path.realpath(root)
+    if absolute_paths:
+        root = os.path.abspath(root)
+    else:
+        root = os.path.normpath(root)
 
     if maxdepth is None:
         walk_generator = os.walk(root)
@@ -183,15 +200,12 @@ def find_git_repos(
     # i think we can detect paths by checking if a pattern starts with any
     # of "./", "../", or "/", ... or if it exactly matches "." or ".."
 
-    # i think we should convert our roots and our paths all to canonical
-    # absolute paths in order to compare them
-
     new_exclude: List[str] = []
     for pattern in exclude:
         if pattern in [".", ".."]:
             pattern = pattern + "/"
         if any(pattern.startswith(prefix) for prefix in ("./", "../", "/")):
-            new_exclude.append(os.path.realpath(pattern))
+            new_exclude.append(os.path.normpath(pattern))
         else:
             new_exclude.append("*/" + pattern)
 
@@ -216,56 +230,56 @@ def find_git_repos(
     return repos
 
 
-def update_branch(repo: git.Repo, branch: git.Head, lprune: bool = False) -> None:
+def update_branch(repo: Repo, branch: git.Head, lprune: bool = False) -> None:
     """if a branch has a remote tracking branch, update it."""
 
     checked_out = branch_is_checked_out_anywhere(repo, branch)
     tracking_branch = branch.tracking_branch()
     if tracking_branch is None:
-        logger.debug("%s: no tracking branch set: %s", repo.working_dir, branch)
+        logger.debug("%s: no tracking branch set: %s", repo.orig_path, branch)
     elif not tracking_branch.is_valid():
         if (not checked_out) and lprune:
-            logger.info("%s: Pruning local branch: %s", repo.working_dir, branch)
+            logger.info("%s: Pruning local branch: %s", repo.orig_path, branch)
             repo.delete_head(branch, force=True)
         else:
             logger.warning(
                 "%s: Failed to update branch; tracking branch gone upstream: %s",
-                repo.working_dir,
+                repo.orig_path,
                 branch,
             )
     elif not repo.is_ancestor(branch, tracking_branch):
-        logger.warning("%s: Failed to update branch; not fast-forward: %s", repo.working_dir, branch)
+        logger.warning("%s: Failed to update branch; not fast-forward: %s", repo.orig_path, branch)
     elif repo.is_ancestor(tracking_branch, branch):
-        logger.debug("%s: no changes for branch: %s", repo.working_dir, branch)
+        logger.debug("%s: no changes for branch: %s", repo.orig_path, branch)
     elif checked_out:
         # branch is checked out *somewhere*, but not necessarily here...
         if repo.head.is_detached or repo.head.ref != branch:
             # its checked out somewhere else!
-            logger.info("%s: skipping branch checked out elsewhere: %s", repo.working_dir, branch)
+            logger.info("%s: skipping branch checked out elsewhere: %s", repo.orig_path, branch)
         elif repo.is_dirty():
             logger.warning(
                 "%s: Refusing to update checked out branch: local changes would be overwritten: %s",
-                repo.working_dir,
+                repo.orig_path,
                 branch,
             )
         else:
-            logger.info("%s: fast-forwarding checked out branch: %s", repo.working_dir, branch)
+            logger.info("%s: fast-forwarding checked out branch: %s", repo.orig_path, branch)
             repo.head.reset(tracking_branch, index=True, working_tree=True)
     else:
         branch.commit = tracking_branch.commit
-        logger.info("%s: Updated branch: %s", repo.working_dir, branch)
+        logger.info("%s: Updated branch: %s", repo.orig_path, branch)
 
 
 def update_repo(path: str, lprune: bool = False) -> bool:
     failures = False
     try:
-        repo = git.Repo(path)
+        repo = Repo(path)
     except Exception:
         logger.exception("Failed to initialize repository: %s", path)
         failures = True
     else:
         for remote in repo.remotes:
-            logger.debug("fetching: %s, %s", repo.working_dir, remote)
+            logger.debug("fetching: %s, %s", repo.orig_path, remote)
             start = time.monotonic()
             while True:
                 fetchinfolist = []
@@ -282,12 +296,12 @@ def update_repo(path: str, lprune: bool = False) -> bool:
                         logger.warning("caught the thing; sleeping - (%s)", repo)
                         time.sleep(5)
                 except Exception:
-                    logger.exception("Failed to fetch: %s, %s", repo.working_dir, remote)
+                    logger.exception("Failed to fetch: %s, %s", repo.orig_path, remote)
                     failures = True
                     break
 
             if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("fetchinfolist: %s, %s: %s", repo.working_dir, remote, fetchinfolist_to_str(fetchinfolist))
+                logger.debug("fetchinfolist: %s, %s: %s", repo.orig_path, remote, fetchinfolist_to_str(fetchinfolist))
 
         for branch in repo.branches:
             try:
@@ -295,7 +309,7 @@ def update_repo(path: str, lprune: bool = False) -> bool:
             except Exception as exc:
                 logger.exception(
                     "%s: Failed to update branch: %s (%s)",
-                    repo.working_dir,
+                    repo.orig_path,
                     branch,
                     exc,
                 )
@@ -304,20 +318,20 @@ def update_repo(path: str, lprune: bool = False) -> bool:
     return failures
 
 
-def get_worktrees(repo: git.Repo) -> List[git.Repo]:
+def get_worktrees(repo: Repo) -> List[Repo]:
     """
     given a git Repo, return a list of Repos representing all worktrees related
     to that Repo (including the passed Repo)
     """
     common_dir = Path(repo.common_dir).resolve()
-    parent_repo = git.Repo(common_dir.parent)
+    parent_repo = Repo(common_dir.parent)
     known_repos = [parent_repo]
     worktrees_dir = common_dir.joinpath("worktrees")
     if worktrees_dir.exists():
         for child in worktrees_dir.iterdir():
             gitdir_file = child.joinpath("gitdir")
             gitdir_path = Path(gitdir_file.read_text().strip())
-            child_worktree_repo = git.Repo(gitdir_path.parent)
+            child_worktree_repo = Repo(gitdir_path.parent)
             known_repos.append(child_worktree_repo)
 
     if repo not in known_repos:
@@ -327,7 +341,7 @@ def get_worktrees(repo: git.Repo) -> List[git.Repo]:
     return known_repos
 
 
-def branch_is_checked_out_anywhere(repo: git.Repo, branch: git.Head) -> bool:
+def branch_is_checked_out_anywhere(repo: Repo, branch: git.Head) -> bool:
     """
     find out whether this branch is checked out in this worktree or any related
     worktree
@@ -337,7 +351,7 @@ def branch_is_checked_out_anywhere(repo: git.Repo, branch: git.Head) -> bool:
     if not hasattr(repo, "worktrees"):
         repo.worktrees = get_worktrees(repo)
 
-    worktree: git.Repo
+    worktree: Repo
     for worktree in repo.worktrees:
         # can't do a simple equality check on `branch`, b/c we may be from different Repos
         if (not worktree.head.is_detached) and worktree.head.ref.path == branch.path:
@@ -439,6 +453,13 @@ def parse_arguments(argv: Optional[Sequence[str]]) -> argparse.Namespace:
         help="randomize the order in which repositories are accessed",
     )
 
+    parser.add_argument(
+        "-a",
+        "--absolute",
+        action="store_true",
+        help="make repository paths absolute before operating on them",
+    )
+
     volume_group = parser.add_mutually_exclusive_group()
     volume_group.add_argument(
         "-v",
@@ -504,6 +525,7 @@ def _main_singlethreaded(args: argparse.Namespace) -> bool:
             exclude=args.exclude,
             randomized=args.random_order,
             force_recurse=args.force_recurse,
+            absolute_paths=args.absolute,
         )
 
         if args.print:
@@ -533,6 +555,7 @@ def _main_multithreaded(args: argparse.Namespace) -> bool:
             exclude=args.exclude,
             randomized=args.random_order,
             force_recurse=args.force_recurse,
+            absolute_paths=args.absolute,
         )
 
         for repo in repos:
