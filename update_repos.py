@@ -1,8 +1,10 @@
-#!/usr/bin/python3
+#!/usr/local/bin/python3
 
 """
 Update git repositories from remotes.
 """
+
+from __future__ import annotations
 
 import argparse
 import fnmatch
@@ -11,22 +13,20 @@ import logging.config
 import os
 import random
 import time
+from collections.abc import Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from functools import cached_property
 from itertools import chain
 from pathlib import Path
-from typing import *
+from typing import Optional, Self, TypeAlias, Union
 
-import git  # type: ignore
+import git
 
 __all__ = [
     "MyExecutor",
+    "Repo",
     "no_traceback_log_filter",
     "depthwalk",
-    "find_git_repos",
-    "update_regular_tracking_branch",
-    "update_current_tracking_branch",
-    "update_branch",
-    "update_repo",
     "parse_arguments",
     "main",
 ]
@@ -74,7 +74,11 @@ FETCHINFO_FLAGS = {
 logging.config.dictConfig(LOGGING_CONFIG)
 logger = logging.getLogger("update-repos")
 
-WalkEntry = Tuple[str, List[str], List[str]]
+# the triplets that `os.walk` & friends yield
+WalkEntry: TypeAlias = tuple[str, list[str], list[str]]
+
+# things that resolve to a commit
+CommitRef: TypeAlias = Union[git.Commit, git.Tag, git.Head]
 
 
 def no_traceback_log_filter(record: logging.LogRecord) -> bool:
@@ -120,22 +124,13 @@ class MyExecutor(ThreadPoolExecutor):
         yield from self._futures
 
 
-class Repo(git.Repo):
-    """Just like git.Repo, but with `orig_path` attribute"""
-    # i'm tired of my logs being jam packed with absolute paths
-
-    def __init__(self, pathlike, *args, **kwargs):
-        super().__init__(pathlike, *args, **kwargs)
-        self.orig_path = pathlike
-
-
-def depthwalk(top: str, maxdepth: int = float('inf'), **kwargs) -> Iterator[WalkEntry]:
-    """just like `os.walk`, but with new added `maxdepth` parameter!"""
-    depthmap: Dict[str, int] = {top: 0}
+def depthwalk(top: str, maxdepth: int = -1, **kwargs) -> Iterator[WalkEntry]:
+    """just like `os.walk`, but with new added `maxdepth` parameter! negative value means 'no limit'."""
+    depthmap: dict[str, int] = {top: 0}
     for path, dirs, files in os.walk(top, **kwargs):
         yield path, dirs, files
         here = depthmap[path]
-        if here >= maxdepth:
+        if here >= maxdepth >= 0:
             dirs.clear()
             continue
         for dir in dirs:
@@ -159,127 +154,132 @@ def backwalk(top: str) -> Iterator[WalkEntry]:
         yield curr, dirs, files
 
 
-def find_git_repos(
-    root: str,
-    maxdepth: Optional[int] = None,
-    exclude: Optional[Iterable[str]] = None,
-    randomized: bool = False,
-    force_recurse: bool = False,
-    absolute_paths: bool = False,
-) -> List[str]:
-    """
-    find git repositories above and beneath a root directory, optionally
-    limiting max depth. (will not return submodules)
-    """
+class Repo(git.Repo):
+    """Just like git.Repo, but with more"""
 
-    logger.debug("finding git repositories: %s (maxdepth=%s)", root, maxdepth)
+    def __init__(self, pathlike, *args, **kwargs):
+        super().__init__(pathlike, *args, **kwargs)
+        # keep track of the path that was passed to us
+        self.orig_path = pathlike
 
-    if absolute_paths:
-        root = os.path.abspath(root)
-    else:
-        root = os.path.normpath(root)
+    @classmethod
+    def find_recursive(
+        cls: type[Self],
+        root: str,
+        maxdepth: Optional[int] = None,
+        exclude: Optional[Sequence[str]] = None,
+        randomized: bool = False,
+        force_recurse: bool = False,
+        absolute_paths: bool = False,
+    ) -> list[Self]:
+        """
+        find git repositories above and beneath a root directory, optionally
+        limiting max depth. (will not return submodules)
+        """
 
-    if maxdepth is None:
-        walk_generator = os.walk(root)
-    else:
-        walk_generator = depthwalk(root, maxdepth)
+        logger.debug("%s: finding git repositories: (maxdepth=%s)", root, maxdepth)
 
-    # include ancestors of this directory, from low to high
-    walk_generator = chain(walk_generator, backwalk(root))
-
-    if not exclude:
-        exclude = []
-
-    # possibilities for an exclusion pattern:
-    # a single directory component (".git")
-    # a partial path (".git/config")
-    # a full relative path ("./workspace/mmicro")
-    # ... an absolute path? ("/opt/dev/core.git")
-
-    # i think this boils down to being either a path or a path fragment
-    # i think we can detect paths by checking if a pattern starts with any
-    # of "./", "../", or "/", ... or if it exactly matches "." or ".."
-
-    new_exclude: List[str] = []
-    for pattern in exclude:
-        if pattern in [".", ".."]:
-            pattern = pattern + "/"
-        if any(pattern.startswith(prefix) for prefix in ("./", "../", "/")):
-            new_exclude.append(os.path.normpath(pattern))
+        if absolute_paths:
+            root = os.path.abspath(root)
         else:
-            new_exclude.append("*/" + pattern)
+            root = os.path.normpath(root)
 
-    repos = []
-
-    for path, dirs, files in walk_generator:
-        if ".git" in dirs or ".git" in files:
-            repos.append(path)
-            if not force_recurse:
-                # clearing `dirs` prevents `os.walk` from traversing any deeper
-                dirs.clear()
-
-        long_short_map = {os.path.join(path, dir): dir for dir in dirs}
-
-        for pattern in new_exclude:
-            for match in fnmatch.filter(long_short_map.keys(), pattern):
-                dirs.remove(long_short_map[match])
-
-    if randomized:
-        random.shuffle(repos)
-
-    return repos
-
-
-def update_branch(repo: Repo, branch: git.Head, lprune: bool = False) -> None:
-    """if a branch has a remote tracking branch, update it."""
-
-    checked_out = branch_is_checked_out_anywhere(repo, branch)
-    tracking_branch = branch.tracking_branch()
-    if tracking_branch is None:
-        logger.debug("%s: no tracking branch set: %s", repo.orig_path, branch)
-    elif not tracking_branch.is_valid():
-        if (not checked_out) and lprune:
-            logger.info("%s: Pruning local branch: %s", repo.orig_path, branch)
-            repo.delete_head(branch, force=True)
+        if maxdepth is None:
+            walk_generator = os.walk(root)
         else:
-            logger.warning(
-                "%s: Failed to update branch; tracking branch gone upstream: %s",
-                repo.orig_path,
-                branch,
-            )
-    elif not repo.is_ancestor(branch, tracking_branch):
-        logger.warning("%s: Failed to update branch; not fast-forward: %s", repo.orig_path, branch)
-    elif repo.is_ancestor(tracking_branch, branch):
-        logger.debug("%s: no changes for branch: %s", repo.orig_path, branch)
-    elif checked_out:
-        # branch is checked out *somewhere*, but not necessarily here...
-        if repo.head.is_detached or repo.head.ref != branch:
-            # its checked out somewhere else!
-            logger.info("%s: skipping branch checked out elsewhere: %s", repo.orig_path, branch)
-        elif repo.is_dirty():
-            logger.warning(
-                "%s: Refusing to update checked out branch: local changes would be overwritten: %s",
-                repo.orig_path,
-                branch,
-            )
+            walk_generator = depthwalk(root, maxdepth)
+
+        # include ancestors of this directory, from low to high
+        walk_generator = chain(walk_generator, backwalk(root))
+
+        if not exclude:
+            exclude = []
+
+        # possibilities for an exclusion pattern:
+        # a single directory component (".git")
+        # a partial path (".git/config")
+        # a full relative path ("./workspace/mmicro")
+        # ... an absolute path? ("/opt/dev/core.git")
+
+        # i think this boils down to being either a path or a path fragment
+        # i think we can detect paths by checking if a pattern starts with any
+        # of "./", "../", or "/", ... or if it exactly matches "." or ".."
+
+        new_exclude: list[str] = []
+        for pattern in exclude:
+            if pattern in [".", ".."]:
+                pattern = pattern + "/"
+            if any(pattern.startswith(prefix) for prefix in ("./", "../", "/")):
+                new_exclude.append(os.path.normpath(pattern))
+            else:
+                new_exclude.append("*/" + pattern)
+
+        repos: list[Self] = []
+
+        for path, dirs, files in walk_generator:
+            if ".git" in dirs or ".git" in files:
+                repos.append(cls(path))
+                if not force_recurse:
+                    # clearing `dirs` prevents `os.walk` from traversing any deeper
+                    dirs.clear()
+
+            long_short_map = {os.path.join(path, dir): dir for dir in dirs}
+
+            for pattern in new_exclude:
+                for match in fnmatch.filter(long_short_map.keys(), pattern):
+                    dirs.remove(long_short_map[match])
+
+        if randomized:
+            random.shuffle(repos)
+
+        return repos
+
+    def is_ancestor(self, ancestor_rev: CommitRef, rev: CommitRef) -> bool:
+        return super().is_ancestor(ancestor_rev, rev)  # type: ignore
+
+    def update_branch(self: Self, branch: git.Head, lprune: bool = False) -> None:
+        """if a branch has a remote tracking branch, update it."""
+
+        checked_out = self.branch_is_checked_out_anywhere(branch)
+        tracking_branch = branch.tracking_branch()
+        if tracking_branch is None:
+            logger.debug("%s: no tracking branch set: %s", self.orig_path, branch)
+        elif not tracking_branch.is_valid():
+            if (not checked_out) and lprune:
+                logger.info("%s: Pruning local branch: %s", self.orig_path, branch)
+                self.delete_head(branch, force=True)
+            else:
+                logger.warning(
+                    "%s: Failed to update branch; tracking branch gone upstream: %s",
+                    self.orig_path,
+                    branch,
+                )
+        elif not self.is_ancestor(branch, tracking_branch):
+            logger.warning("%s: Failed to update branch; not fast-forward: %s", self.orig_path, branch)
+        elif self.is_ancestor(tracking_branch, branch):
+            logger.debug("%s: no changes for branch: %s", self.orig_path, branch)
+        elif checked_out:
+            # branch is checked out *somewhere*, but not necessarily here...
+            if self.head.is_detached or self.head.ref != branch:
+                # its checked out somewhere else!
+                logger.info("%s: skipping branch checked out elsewhere: %s", self.orig_path, branch)
+            elif self.is_dirty():
+                logger.warning(
+                    "%s: Refusing to update checked out branch: local changes would be overwritten: %s",
+                    self.orig_path,
+                    branch,
+                )
+            else:
+                logger.info("%s: fast-forwarding checked out branch: %s", self.orig_path, branch)
+                self.head.reset(tracking_branch, index=True, working_tree=True)
         else:
-            logger.info("%s: fast-forwarding checked out branch: %s", repo.orig_path, branch)
-            repo.head.reset(tracking_branch, index=True, working_tree=True)
-    else:
-        branch.commit = tracking_branch.commit
-        logger.info("%s: Updated branch: %s", repo.orig_path, branch)
+            branch.commit = tracking_branch.commit
+            logger.info("%s: Updated branch: %s", self.orig_path, branch)
 
-
-def update_repo(path: str, lprune: bool = False) -> bool:
-    failures = False
-    try:
-        repo = Repo(path)
-    except Exception:
-        logger.exception("Failed to initialize repository: %s", path)
-        failures = True
-    else:
-        for remote in repo.remotes:
-            logger.debug("fetching: %s, %s", repo.orig_path, remote)
+    def update(self: Self, lprune: bool = False) -> bool:
+        failures = False
+        for remote in self.remotes:
+            logger.debug("%s: fetching: %s", self.orig_path, remote)
             start = time.monotonic()
             while True:
                 fetchinfolist = []
@@ -287,109 +287,106 @@ def update_repo(path: str, lprune: bool = False) -> bool:
                     fetchinfolist = remote.fetch()
                     break
                 except git.GitCommandError as exc:
-                    logger.error(exc)
+                    logger.exception("%s: %s", self.orig_path, exc)
                     if time.monotonic() - start > 120:
-                        logger.error("caught the thing too many times; giving up")
+                        logger.error("%s: caught the thing too many times; giving up", self.orig_path)
                         failures = True
                         break
                     else:
-                        logger.warning("caught the thing; sleeping - (%s)", repo)
+                        logger.warning("%s: caught the thing; sleeping...", self.orig_path)
                         time.sleep(5)
                 except Exception:
-                    logger.exception("Failed to fetch: %s, %s", repo.orig_path, remote)
+                    logger.exception("%s: Failed to fetch: %s", self.orig_path, remote)
                     failures = True
                     break
 
             if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("fetchinfolist: %s, %s: %s", repo.orig_path, remote, fetchinfolist_to_str(fetchinfolist))
+                logger.debug(
+                    "%s: fetchinfolist: %s: %s", self.orig_path, remote, self.fetchinfolist_to_str(fetchinfolist)
+                )
 
-        for branch in repo.branches:
+        for branch in self.branches:
             try:
-                update_branch(repo, branch, lprune)
+                self.update_branch(branch, lprune)
             except Exception as exc:
                 logger.exception(
                     "%s: Failed to update branch: %s (%s)",
-                    repo.orig_path,
+                    self.orig_path,
                     branch,
                     exc,
                 )
                 failures = True
 
-    return failures
+        return failures
 
+    @cached_property
+    def worktrees(self: Self) -> list[Self]:
+        """
+        given a git Repo, return a list of Repos representing all worktrees related
+        to that Repo (including the passed Repo)
+        """
+        MyType = type(self)
+        common_dir = Path(self.common_dir).resolve()
+        parent_repo = MyType(common_dir.parent)
+        known_repos = [parent_repo]
+        worktrees_dir = common_dir.joinpath("worktrees")
+        if worktrees_dir.exists():
+            for child in worktrees_dir.iterdir():
+                gitdir_file = child.joinpath("gitdir")
+                gitdir_path = Path(gitdir_file.read_text().strip())
+                child_worktree_repo = MyType(gitdir_path.parent)
+                known_repos.append(child_worktree_repo)
 
-def get_worktrees(repo: Repo) -> List[Repo]:
-    """
-    given a git Repo, return a list of Repos representing all worktrees related
-    to that Repo (including the passed Repo)
-    """
-    common_dir = Path(repo.common_dir).resolve()
-    parent_repo = Repo(common_dir.parent)
-    known_repos = [parent_repo]
-    worktrees_dir = common_dir.joinpath("worktrees")
-    if worktrees_dir.exists():
-        for child in worktrees_dir.iterdir():
-            gitdir_file = child.joinpath("gitdir")
-            gitdir_path = Path(gitdir_file.read_text().strip())
-            child_worktree_repo = Repo(gitdir_path.parent)
-            known_repos.append(child_worktree_repo)
+        if self not in known_repos:
+            # repo's haunted
+            raise ValueError("passed repo not in list of known repos", self, known_repos)
 
-    if repo not in known_repos:
-        # repo's haunted
-        raise ValueError("passed repo not in list of known repos", repo, known_repos)
+        return known_repos
 
-    return known_repos
+    def branch_is_checked_out_anywhere(self: Self, branch: git.Head) -> bool:
+        """
+        find out whether this branch is checked out in this worktree or any related
+        worktree
+        """
 
+        for worktree in self.worktrees:
+            # can't do a simple equality check on `branch`, b/c we may be from different Repos
+            if (not worktree.head.is_detached) and worktree.head.ref.path == branch.path:
+                # this branch is checked out in this worktree
+                return True
+        return False
 
-def branch_is_checked_out_anywhere(repo: Repo, branch: git.Head) -> bool:
-    """
-    find out whether this branch is checked out in this worktree or any related
-    worktree
-    """
+    @classmethod
+    def fetchinfo_to_str(cls: type[Self], fetchinfo: git.FetchInfo) -> str:
+        out = str(fetchinfo.ref)
+        if (remote_ref := fetchinfo.remote_ref_path) and (remote_ref := str(remote_ref).strip()):
+            out = f"({remote_ref}) {out}"
+        if fetchinfo.flags & (git.FetchInfo.FORCED_UPDATE | git.FetchInfo.FAST_FORWARD):
+            out = f"{out} <- {fetchinfo.old_commit}"
+        flag_list = [flag_name for flag, flag_name in FETCHINFO_FLAGS.items() if flag & fetchinfo.flags]
+        flags = " | ".join(flag_list)
+        out = f"{out} ({flags})"
+        return out
 
-    # need to know about worktrees, but don't need to recalculate them for every branch
-    if not hasattr(repo, "worktrees"):
-        repo.worktrees = get_worktrees(repo)
+    @classmethod
+    def fetchinfolist_to_str(cls: type[Self], fetchinfolist: list[git.FetchInfo], indent=4, show_all=False) -> str:
+        # remove boring items
+        if not show_all:
+            fetchinfolist = [item for item in fetchinfolist if item.flags ^ git.FetchInfo.HEAD_UPTODATE]
+        # short-circuit for boring lists
+        if not fetchinfolist:
+            return "[]"
+        # translate each
+        lines = [cls.fetchinfo_to_str(item) for item in fetchinfolist]
+        separator = "\n"
+        if indent:
+            separator += " " * indent
 
-    worktree: Repo
-    for worktree in repo.worktrees:
-        # can't do a simple equality check on `branch`, b/c we may be from different Repos
-        if (not worktree.head.is_detached) and worktree.head.ref.path == branch.path:
-            # this branch is checked out in this worktree
-            return True
-    return False
-
-
-def fetchinfo_to_str(fetchinfo: git.FetchInfo) -> str:
-    out = str(fetchinfo.ref)
-    if fetchinfo.remote_ref_path.strip():
-        out = f"({fetchinfo.remote_ref_path}) {out}"
-    if fetchinfo.flags & (git.FetchInfo.FORCED_UPDATE | git.FetchInfo.FAST_FORWARD):
-        out = f"{out} <- {fetchinfo.old_commit}"
-    flag_list = [flag_name for flag, flag_name in FETCHINFO_FLAGS.items() if flag & fetchinfo.flags]
-    flags = " | ".join(flag_list)
-    out = f"{out} ({flags})"
-    return out
-
-
-def fetchinfolist_to_str(fetchinfolist: List[git.FetchInfo], indent=4, show_all=False) -> str:
-    # remove boring items
-    if not show_all:
-        fetchinfolist = [item for item in fetchinfolist if item.flags ^ git.FetchInfo.HEAD_UPTODATE]
-    # short-circuit for boring lists
-    if not fetchinfolist:
-        return "[]"
-    # translate each
-    lines = [fetchinfo_to_str(item) for item in fetchinfolist]
-    separator = "\n"
-    if indent:
-        separator += " " * indent
-
-    return separator + separator.join(lines)
+        return separator + separator.join(lines)
 
 
 def parse_arguments(argv: Optional[Sequence[str]]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Update git repositories from remotes.")
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "directories",
         nargs="*",
@@ -422,8 +419,12 @@ def parse_arguments(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     )
 
     # action_group = parser.add_mutually_exclusive_group()
-    # action_group.add_argument("-u", "--update", action="store_true", help="update repositories (the default)")
-    # action_group.add_argument("-s", "--status", action="store_true", help="report the status of located repositories")
+    # action_group.add_argument(
+    #     "-u", "--update", action="store_true", default=True, help="update repositories (the default)"
+    # )
+    # action_group.add_argument(
+    #     "-s", "--status", action="store_true", help="report the status of located repositories"
+    # )
 
     parser.add_argument(
         "-p",
@@ -483,6 +484,7 @@ def parse_arguments(argv: Optional[Sequence[str]]) -> argparse.Namespace:
         help="display tracebacks on error (defaults to True when verbose >= 2)",
     )
     traceback_group.add_argument(
+        "-T",
         "--no-traceback",
         action="store_true",
         help="disable tracebacks (even when verbose >= 2)",
@@ -519,7 +521,7 @@ def _main_singlethreaded(args: argparse.Namespace) -> bool:
     failures = False
 
     for directory in args.directories:
-        repos: List[str] = find_git_repos(
+        repos: list[Repo] = Repo.find_recursive(
             directory,
             maxdepth=args.depth,
             exclude=args.exclude,
@@ -536,7 +538,7 @@ def _main_singlethreaded(args: argparse.Namespace) -> bool:
                 if args.slow:
                     time.sleep(1)
                 try:
-                    failures |= update_repo(repo, args.lprune)
+                    failures |= repo.update(args.lprune)
                 except Exception as exc:
                     logger.exception("Trapped error: %s", exc)
                     failures = True
@@ -549,7 +551,7 @@ def _main_multithreaded(args: argparse.Namespace) -> bool:
     failures = False
 
     for directory in args.directories:
-        repos: List[str] = find_git_repos(
+        repos: list[Repo] = Repo.find_recursive(
             directory,
             maxdepth=args.depth,
             exclude=args.exclude,
@@ -559,7 +561,7 @@ def _main_multithreaded(args: argparse.Namespace) -> bool:
         )
 
         for repo in repos:
-            executor.submit(update_repo, repo, args.lprune)
+            executor.submit(repo.update, args.lprune)
 
     try:
         for ftr in as_completed(executor.futures()):
