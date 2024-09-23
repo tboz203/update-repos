@@ -4,8 +4,7 @@
 # )
 
 unset -f __update_repos_comp
-__update_repos_comp()
-{
+__update_repos_comp() {
     : 'bash completion function for update-repos'
     # usage: update-repos [-h] [-d DEPTH] [-e EXCLUDE] [-R] [-1] [-p] [-l] [-s] [-r] [-a] [-v | -q] [-t | -T] [directories ...]
     #
@@ -37,16 +36,16 @@ __update_repos_comp()
 
     # handle options expecting arguments
     case "$prev" in
-        -e | --exclude)
-            # --exclude expects a directory pattern, we'll just offer directories
-            _filedir -d
-            return
-            ;;
-        -d | --depth)
-            # --depth expects a number, but listing out all possible numbers would take too long
-            COMPREPLY=("enter a number..." "")
-            return
-            ;;
+    -e | --exclude)
+        # --exclude expects a directory pattern, we'll just offer directories
+        _filedir -d
+        return
+        ;;
+    -d | --depth)
+        # --depth expects a number, but listing out all possible numbers would take too long
+        COMPREPLY=("enter a number..." "")
+        return
+        ;;
     esac
 
     # if we've split a `--word=arg` token, we ought to be done now
@@ -55,9 +54,11 @@ __update_repos_comp()
     # the full battery of options
     # (had been using _parse_usage & _parse_help, but that's slow...)
     local optional=(
-        -h -d -e -R -1 -p -l -s -r -a -v -q -t -T
-        --help --depth --exclude --force-recurse --single-thread --print --lprune
-        --slow --random-order --absolute --verbose --quiet --traceback --no-traceback
+        -d= -e=
+        -h -R -1 -p -l -s -r -a -v -q -t -T
+        --depth= --exclude=
+        --help --force-recurse --single-thread --print --lprune --slow
+        --random-order --absolute --verbose --quiet --traceback --no-traceback
     )
 
     # only include options if you're already typing an option
@@ -72,10 +73,8 @@ __update_repos_comp()
 } || return 1
 
 # the `nosort` option appears to have been added in bash 4.4
-if [[ ${BASH_VERSINFO[0]} -ge 5 || (${BASH_VERSINFO[0]} -eq 4 && ${BASH_VERSINFO[1]} -ge 4) ]]; then
+if ((BASH_VERSINFO[0] >= 5 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4))); then
     complete -o nosort -F __update_repos_comp update-repos
-    complete -o nosort -F __update_repos_comp update_repos.py
 else
     complete -F __update_repos_comp update-repos
-    complete -F __update_repos_comp update_repos.py
 fi
