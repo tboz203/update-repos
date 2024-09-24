@@ -13,12 +13,12 @@ import logging.config
 import os
 import random
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Generator, Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from functools import cached_property
+from contextlib import contextmanager
+from contextvars import ContextVar
 from itertools import chain
-from pathlib import Path
-from typing import Optional, Self, TypeAlias, Union
+from typing import Any, Optional, ParamSpec, Self, TypeAlias, TypeVar, Union
 
 import git
 
@@ -31,34 +31,8 @@ __all__ = [
     "main",
 ]
 
-LOGGING_CONFIG = {
-    "version": 1,
-    "disable_existing_loggers": False,
-    "formatters": {
-        "standard": {
-            "format": ("[%(levelname)8s %(asctime)s] %(message)s"),
-            "datefmt": "%Y-%m-%d %H:%M:%S",
-        },
-        "verbose": {
-            "format": ("[%(levelname)8s %(asctime)s %(threadName)s %(name)s] %(message)s"),
-            "datefmt": "%Y-%m-%d %H:%M:%S",
-        },
-    },
-    "handlers": {
-        "console": {
-            "level": "DEBUG",
-            "formatter": "standard",
-            "class": "logging.StreamHandler",
-        },
-    },
-    "loggers": {
-        "update-repos": {
-            "handlers": ["console"],
-            "level": "WARNING",
-            "propagate": False,
-        },
-    },
-}
+T = TypeVar("T")
+P = ParamSpec("P")
 
 FETCHINFO_FLAGS = {
     git.FetchInfo.ERROR: "ERROR",
@@ -71,8 +45,46 @@ FETCHINFO_FLAGS = {
     git.FetchInfo.TAG_UPDATE: "TAG_UPDATE",
 }
 
-logging.config.dictConfig(LOGGING_CONFIG)
-logger = logging.getLogger("update-repos")
+REPO_DIR: ContextVar[str] = ContextVar("REPO_DIR", default="(no repo set)")
+
+LOGGING_CONFIG = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "standard": {
+            "format": "[%(levelname)8s %(asctime)s] %(repo_dir)s: %(message)s",
+            "datefmt": "%Y-%m-%d %H:%M:%S",
+        },
+        "verbose": {
+            "format": (
+                "[%(levelname)8s %(asctime)s %(threadName)s %(name)s] %(repo_dir)s: %(message)s"
+            ),
+            "datefmt": "%Y-%m-%d %H:%M:%S",
+        },
+    },
+    "filters": {
+        "repo_dir_context": {
+            "()": f"{__name__}.ContextAddedFilter",
+            "var": REPO_DIR,
+            "attribute": "repo_dir",
+        },
+    },
+    "handlers": {
+        "console": {
+            "level": "DEBUG",
+            "formatter": "standard",
+            "filters": ["repo_dir_context"],
+            "class": "logging.StreamHandler",
+        },
+    },
+    "loggers": {
+        "update-repos": {
+            "handlers": ["console"],
+            "level": "WARNING",
+            "propagate": False,
+        },
+    },
+}
 
 # the triplets that `os.walk` & friends yield
 WalkEntry: TypeAlias = tuple[str, list[str], list[str]]
@@ -80,31 +92,24 @@ WalkEntry: TypeAlias = tuple[str, list[str], list[str]]
 # things that resolve to a commit
 CommitRef: TypeAlias = Union[git.Commit, git.Tag, git.Head]
 
+logger = logging.getLogger("update-repos")
+
+
+class ContextAddedFilter(logging.Filter):
+    def __init__(self, *args, var: ContextVar, attribute: str, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.var = var
+        self.attribute = attribute
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        setattr(record, self.attribute, self.var.get())
+        return super().filter(record)
+
 
 def no_traceback_log_filter(record: logging.LogRecord) -> bool:
     """log filter function to unconditionally remove exception info"""
     record.exc_info = None
     return True
-
-
-# removing these for now b/c unsuitable for multithreaded execution
-
-# def add_prefix_log_filter_factory(prefix: str) -> Callable[[logging.LogRecord], bool]:
-#     """create a log filter function that prefixes all log messages with a string constant"""
-#     def log_filter(record: logging.LogRecord) -> bool:
-#         record.message = prefix + record.message
-#         # the filter will not drop any records
-#         return True
-#     return log_filter
-
-
-# @contextmanager
-# def log_prefix(logger: logging.Logger, prefix: str):
-#     """context manager to prefix messages sent to the given logger with the given message"""
-#     log_filter = add_prefix_log_filter_factory(prefix)
-#     logger.addFilter(log_filter)
-#     yield
-#     logger.removeFilter(log_filter)
 
 
 class MyExecutor(ThreadPoolExecutor):
@@ -120,74 +125,48 @@ class MyExecutor(ThreadPoolExecutor):
         self._futures.append(ftr)
         return ftr
 
-    def futures(self) -> Iterator[Future]:
+    def futures(self) -> Generator[Future]:
         yield from self._futures
-
-
-def depthwalk(top: str, maxdepth: int = -1, **kwargs) -> Iterator[WalkEntry]:
-    """just like `os.walk`, but with new added `maxdepth` parameter! negative value means 'no limit'."""
-    depthmap: dict[str, int] = {top: 0}
-    for path, dirs, files in os.walk(top, **kwargs):
-        yield path, dirs, files
-        here = depthmap[path]
-        if here >= maxdepth >= 0:
-            dirs.clear()
-            continue
-        for dir in dirs:
-            child = os.path.join(path, dir)
-            depthmap[child] = here + 1
-
-
-def backwalk(top: str) -> Iterator[WalkEntry]:
-    """just like `os.walk`, but goes up instead of down"""
-    curr = os.path.abspath(top)
-    while True:
-        parent = os.path.dirname(curr)
-        if not parent or curr == parent:
-            break
-        curr = parent
-
-        dirs, files = [], []
-        for item in os.scandir(curr):
-            (dirs if item.is_dir() else files).append(item.name)
-
-        yield curr, dirs, files
 
 
 class Repo(git.Repo):
     """Just like git.Repo, but with more"""
 
-    def __init__(self, pathlike, *args, **kwargs):
+    def __init__(
+        self,
+        pathlike,
+        *args,
+        **kwargs,
+    ):
         super().__init__(pathlike, *args, **kwargs)
-        # keep track of the path that was passed to us
-        self.orig_path = pathlike
+        self.orig_path = str(pathlike)
+        self._sibling_worktrees: Optional[list[Self]] = None
 
     @classmethod
     def find_recursive(
-        cls: type[Self],
+        cls,
         root: str,
         maxdepth: Optional[int] = None,
-        exclude: Optional[Sequence[str]] = None,
-        randomized: bool = False,
+        exclude: Optional[Iterable[str]] = None,
         force_recurse: bool = False,
         absolute_paths: bool = False,
-    ) -> list[Self]:
+    ) -> Generator[Self]:
         """
         find git repositories above and beneath a root directory, optionally
         limiting max depth. (will not return submodules)
         """
-
-        logger.debug("%s: finding git repositories: (maxdepth=%s)", root, maxdepth)
 
         if absolute_paths:
             root = os.path.abspath(root)
         else:
             root = os.path.normpath(root)
 
+        logger.debug("%s: finding git repositories: (maxdepth=%s)", root, maxdepth)
+
         if maxdepth is None:
             walk_generator = os.walk(root)
         else:
-            walk_generator = depthwalk(root, maxdepth)
+            walk_generator = depthwalk(root, maxdepth=maxdepth)
 
         # include ancestors of this directory, from low to high
         walk_generator = chain(walk_generator, backwalk(root))
@@ -214,11 +193,9 @@ class Repo(git.Repo):
             else:
                 new_exclude.append("*/" + pattern)
 
-        repos: list[Self] = []
-
         for path, dirs, files in walk_generator:
             if ".git" in dirs or ".git" in files:
-                repos.append(cls(path))
+                yield cls(path)
                 if not force_recurse:
                     # clearing `dirs` prevents `os.walk` from traversing any deeper
                     dirs.clear()
@@ -229,121 +206,185 @@ class Repo(git.Repo):
                 for match in fnmatch.filter(long_short_map.keys(), pattern):
                     dirs.remove(long_short_map[match])
 
-        if randomized:
-            random.shuffle(repos)
-
-        return repos
-
     def is_ancestor(self, ancestor_rev: CommitRef, rev: CommitRef) -> bool:
         return super().is_ancestor(ancestor_rev, rev)  # type: ignore
 
-    def update_branch(self: Self, branch: git.Head, lprune: bool = False) -> None:
-        """if a branch has a remote tracking branch, update it."""
-
-        checked_out = self.branch_is_checked_out_anywhere(branch)
-        tracking_branch = branch.tracking_branch()
-        if tracking_branch is None:
-            logger.debug("%s: no tracking branch set: %s", self.orig_path, branch)
-        elif not tracking_branch.is_valid():
-            if (not checked_out) and lprune:
-                logger.info("%s: Pruning local branch: %s", self.orig_path, branch)
-                self.delete_head(branch, force=True)
+    def update(self, lprune: bool = False) -> bool:
+        with context(REPO_DIR, self.orig_path):
+            logger.info("Updating repository")
+            failures = False
+            if self.is_main_worktree:
+                failures |= self.update_remotes()
+                failures |= self.update_branches(lprune)
             else:
-                logger.warning(
-                    "%s: Failed to update branch; tracking branch gone upstream: %s",
-                    self.orig_path,
-                    branch,
-                )
-        elif not self.is_ancestor(branch, tracking_branch):
-            logger.warning("%s: Failed to update branch; not fast-forward: %s", self.orig_path, branch)
-        elif self.is_ancestor(tracking_branch, branch):
-            logger.debug("%s: no changes for branch: %s", self.orig_path, branch)
-        elif checked_out:
-            # branch is checked out *somewhere*, but not necessarily here...
-            if self.head.is_detached or self.head.ref != branch:
-                # its checked out somewhere else!
-                logger.info("%s: skipping branch checked out elsewhere: %s", self.orig_path, branch)
-            elif self.is_dirty():
-                logger.warning(
-                    "%s: Refusing to update checked out branch: local changes would be overwritten: %s",
-                    self.orig_path,
-                    branch,
-                )
-            else:
-                logger.info("%s: fast-forwarding checked out branch: %s", self.orig_path, branch)
-                self.head.reset(tracking_branch, index=True, working_tree=True)
-        else:
-            branch.commit = tracking_branch.commit
-            logger.info("%s: Updated branch: %s", self.orig_path, branch)
+                failures |= self.update_checked_out_branch()
+            return failures
 
-    def update(self: Self, lprune: bool = False) -> bool:
-        failures = False
-        for remote in self.remotes:
-            logger.debug("%s: fetching: %s", self.orig_path, remote)
-            start = time.monotonic()
-            while True:
-                fetchinfolist = []
-                try:
-                    fetchinfolist = remote.fetch()
-                    break
-                except git.GitCommandError as exc:
-                    logger.exception("%s: %s", self.orig_path, exc)
-                    if time.monotonic() - start > 120:
-                        logger.error("%s: caught the thing too many times; giving up", self.orig_path)
+    def update_remotes(self) -> bool:
+        with context(REPO_DIR, self.orig_path):
+            failures = False
+            for remote in self.remotes:
+                if remote.config_reader.get("skipFetchAll", fallback=None):
+                    continue
+                logger.debug("fetching: %s", remote)
+                start = time.monotonic()
+                while True:
+                    fetchinfolist = []
+                    try:
+                        fetchinfolist = remote.fetch()
+                        break
+                    except git.GitCommandError as exc:
+                        logger.exception("%s", exc)
+                        if time.monotonic() - start > 120:
+                            logger.error("caught the thing too many times; giving up")
+                            failures = True
+                            break
+                        else:
+                            logger.warning("caught the thing; sleeping...")
+                            time.sleep(5)
+                    except Exception:
+                        logger.exception("Failed to fetch: %s", remote)
                         failures = True
                         break
-                    else:
-                        logger.warning("%s: caught the thing; sleeping...", self.orig_path)
-                        time.sleep(5)
-                except Exception:
-                    logger.exception("%s: Failed to fetch: %s", self.orig_path, remote)
+
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "fetchinfolist: %s: %s",
+                        remote,
+                        self.fetchinfolist_to_str(fetchinfolist),
+                    )
+            return failures
+
+    def update_branches(self, lprune: bool = False) -> bool:
+        """update all local branches from their respective tracking branches (if set)."""
+        with context(REPO_DIR, self.orig_path):
+            failures = False
+            for branch in self.branches:
+                try:
+                    failures |= self.update_branch(branch, lprune)
+                except Exception as exc:
+                    logger.exception("Failed to update branch: %s (%s)", branch, exc)
                     failures = True
-                    break
 
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "%s: fetchinfolist: %s: %s", self.orig_path, remote, self.fetchinfolist_to_str(fetchinfolist)
-                )
+            return failures
 
-        for branch in self.branches:
-            try:
-                self.update_branch(branch, lprune)
-            except Exception as exc:
-                logger.exception(
-                    "%s: Failed to update branch: %s (%s)",
-                    self.orig_path,
+    def update_branch(self, branch: git.Head, lprune: bool = False) -> bool:
+        """fast-forward the given local branch from its tracking branch, if set."""
+        with context(REPO_DIR, self.orig_path):
+            failure = False
+            checked_out = self.branch_is_checked_out_anywhere(branch)
+            tracking_branch = branch.tracking_branch()
+            if tracking_branch is None:
+                logger.info("no tracking branch set: %s", branch)
+            elif not tracking_branch.is_valid():
+                if (not checked_out) and lprune:
+                    logger.info("Pruning local branch: %s", branch)
+                    self.delete_head(branch, force=True)
+                else:
+                    failure = True
+                    logger.warning(
+                        "Failed to update branch; tracking branch gone upstream: %s",
+                        branch,
+                    )
+            elif self.is_ancestor(tracking_branch, branch):
+                logger.debug("no changes for branch: %s", branch)
+            elif not self.is_ancestor(branch, tracking_branch):
+                failure = True
+                logger.warning(
+                    "Failed to update branch; not fast-forward: %s",
                     branch,
-                    exc,
                 )
-                failures = True
+            elif checked_out:
+                # branch is checked out *somewhere*, but not necessarily here...
+                if self.head.is_detached or self.head.ref != branch:
+                    # its checked out somewhere else!
+                    logger.info("skipping branch checked out elsewhere: %s", branch)
+                elif self.is_dirty():
+                    failure = True
+                    logger.warning(
+                        "Refusing to update dirty checked out branch: %s", branch
+                    )
+                else:
+                    logger.info("fast-forwarding checked out branch: %s", branch)
+                    self.head.reset(tracking_branch, index=True, working_tree=True)
+            else:
+                branch.commit = tracking_branch.commit
+                logger.info("Updated branch: %s", branch)
+            return failure
 
-        return failures
+    def update_checked_out_branch(self) -> bool:
+        """update the currently checked out branch of this repository"""
+        with context(REPO_DIR, self.orig_path):
+            failure = False
+            if self.head.is_detached:
+                logger.info("repo is in detached state")
+            elif not isinstance(self.head.ref, git.Head):
+                logger.warning("%s: HEAD not pointed at a Head?: %s", self.head.ref)
+            else:
+                failure = self.update_branch(self.head.ref)
+            return failure
 
-    @cached_property
-    def worktrees(self: Self) -> list[Self]:
+    @property
+    def worktrees(self) -> list[Self]:
         """
         given a git Repo, return a list of Repos representing all worktrees related
         to that Repo (including the passed Repo)
         """
-        MyType = type(self)
-        common_dir = Path(self.common_dir).resolve()
-        parent_repo = MyType(common_dir.parent)
-        known_repos = [parent_repo]
-        worktrees_dir = common_dir.joinpath("worktrees")
-        if worktrees_dir.exists():
-            for child in worktrees_dir.iterdir():
-                gitdir_file = child.joinpath("gitdir")
-                gitdir_path = Path(gitdir_file.read_text().strip())
-                child_worktree_repo = MyType(gitdir_path.parent)
-                known_repos.append(child_worktree_repo)
+        if self._sibling_worktrees:
+            return self._sibling_worktrees
 
-        if self not in known_repos:
-            # repo's haunted
-            raise ValueError("passed repo not in list of known repos", self, known_repos)
+        porcelain: str = self.git.worktree("list", "--porcelain")
 
-        return known_repos
+        # key-value pairs related to a single worktree
+        parts = {}
+        # a collection of parts
+        parts_list = [parts]
+        for line in porcelain.splitlines():
+            if not line:
+                # start of a new group of parts
+                parts = {}
+                parts_list.append(parts)
+                continue
+            lineparts = line.split(" ", maxsplit=1)
+            if len(lineparts) == 2:
+                key, value = lineparts
+            else:
+                key, value = line, True
+            parts[key] = value
 
-    def branch_is_checked_out_anywhere(self: Self, branch: git.Head) -> bool:
+        worktrees = []
+        RepoType = type(self)
+        for parts in parts_list:
+            worktree_dir = parts.get("worktree")
+            if worktree_dir == self.working_dir:
+                worktrees.append(self)
+                continue
+            worktree = RepoType(worktree_dir)
+            worktrees.append(worktree)
+
+        if self not in worktrees:
+            raise RuntimeError(
+                "Own worktree not found in worktrees list", self, worktrees
+            )
+
+        for worktree in worktrees:
+            worktree.worktrees = worktrees
+
+        return self.worktrees
+
+    @worktrees.setter
+    def worktrees(self, worktrees):
+        if self not in worktrees:
+            raise ValueError(
+                "Repo must be among its own sibling worktrees", self, worktrees
+            )
+        self._sibling_worktrees = list(worktrees)
+
+    @property
+    def is_main_worktree(self) -> bool:
+        return self.git_dir == self.common_dir
+
+    def branch_is_checked_out_anywhere(self, branch: git.Head) -> bool:
         """
         find out whether this branch is checked out in this worktree or any related
         worktree
@@ -351,28 +392,42 @@ class Repo(git.Repo):
 
         for worktree in self.worktrees:
             # can't do a simple equality check on `branch`, b/c we may be from different Repos
-            if (not worktree.head.is_detached) and worktree.head.ref.path == branch.path:
+            if (
+                not worktree.head.is_detached
+            ) and worktree.head.ref.path == branch.path:
                 # this branch is checked out in this worktree
                 return True
         return False
 
     @classmethod
-    def fetchinfo_to_str(cls: type[Self], fetchinfo: git.FetchInfo) -> str:
+    def fetchinfo_to_str(cls, fetchinfo: git.FetchInfo) -> str:
         out = str(fetchinfo.ref)
-        if (remote_ref := fetchinfo.remote_ref_path) and (remote_ref := str(remote_ref).strip()):
+        if (remote_ref := fetchinfo.remote_ref_path) and (
+            remote_ref := str(remote_ref).strip()
+        ):
             out = f"({remote_ref}) {out}"
         if fetchinfo.flags & (git.FetchInfo.FORCED_UPDATE | git.FetchInfo.FAST_FORWARD):
             out = f"{out} <- {fetchinfo.old_commit}"
-        flag_list = [flag_name for flag, flag_name in FETCHINFO_FLAGS.items() if flag & fetchinfo.flags]
+        flag_list = [
+            flag_name
+            for flag, flag_name in FETCHINFO_FLAGS.items()
+            if flag & fetchinfo.flags
+        ]
         flags = " | ".join(flag_list)
         out = f"{out} ({flags})"
         return out
 
     @classmethod
-    def fetchinfolist_to_str(cls: type[Self], fetchinfolist: list[git.FetchInfo], indent=4, show_all=False) -> str:
+    def fetchinfolist_to_str(
+        cls, fetchinfolist: list[git.FetchInfo], indent=4, show_all=False
+    ) -> str:
         # remove boring items
         if not show_all:
-            fetchinfolist = [item for item in fetchinfolist if item.flags ^ git.FetchInfo.HEAD_UPTODATE]
+            fetchinfolist = [
+                item
+                for item in fetchinfolist
+                if item.flags ^ git.FetchInfo.HEAD_UPTODATE
+            ]
         # short-circuit for boring lists
         if not fetchinfolist:
             return "[]"
@@ -385,6 +440,55 @@ class Repo(git.Repo):
         return separator + separator.join(lines)
 
 
+def depthwalk(
+    top: str,
+    topdown: bool = True,
+    onerror: Optional[Callable[[OSError], Any]] = None,
+    followlinks: bool = False,
+    maxdepth: Optional[int] = None,
+) -> Generator[WalkEntry]:
+    """just like `os.walk`, but with new added `maxdepth` parameter!"""
+    if maxdepth is None:
+        yield from os.walk(top, topdown, onerror, followlinks)
+        return
+
+    depthmap = {top: 0}
+    for path, dirs, files in os.walk(top, topdown, onerror, followlinks):
+        yield path, dirs, files
+        here = depthmap[path]
+        if here >= maxdepth:
+            dirs.clear()
+            continue
+        for dir in dirs:
+            child = os.path.join(path, dir)
+            depthmap[child] = here + 1
+
+
+def backwalk(top: str) -> Generator[WalkEntry]:
+    """just like `os.walk`, but goes up instead of down"""
+    curr = os.path.abspath(top)
+    while True:
+        parent = os.path.dirname(curr)
+        if not parent or curr == parent:
+            break
+        curr = parent
+
+        dirs, files = [], []
+        for item in os.scandir(curr):
+            (dirs if item.is_dir() else files).append(item.name)
+
+        yield curr, dirs, files
+
+
+@contextmanager
+def context(var: ContextVar[T], value: T):
+    token = var.set(value)
+    try:
+        yield
+    finally:
+        var.reset(token)
+
+
 def parse_arguments(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -394,10 +498,7 @@ def parse_arguments(argv: Optional[Sequence[str]]) -> argparse.Namespace:
         help="directories to search for repositories (defaults to current directory)",
     )
     parser.add_argument(
-        "-d",
-        "--depth",
-        type=int,
-        help="maximum depth to search for repositories",
+        "-d", "--depth", type=int, help="maximum depth to search for repositories"
     )
     parser.add_argument(
         "-e",
@@ -420,10 +521,17 @@ def parse_arguments(argv: Optional[Sequence[str]]) -> argparse.Namespace:
 
     # action_group = parser.add_mutually_exclusive_group()
     # action_group.add_argument(
-    #     "-u", "--update", action="store_true", default=True, help="update repositories (the default)"
+    #     "-u",
+    #     "--update",
+    #     action="store_true",
+    #     default=True,
+    #     help="update repositories (the default)",
     # )
     # action_group.add_argument(
-    #     "-s", "--status", action="store_true", help="report the status of located repositories"
+    #     "-s",
+    #     "--status",
+    #     action="store_true",
+    #     help="report the status of located repositories",
     # )
 
     parser.add_argument(
@@ -447,11 +555,18 @@ def parse_arguments(argv: Optional[Sequence[str]]) -> argparse.Namespace:
         help="try to avoid ratelimit. implies `--single-thread`",
     )
 
-    parser.add_argument(
+    order_group = parser.add_mutually_exclusive_group()
+    order_group.add_argument(
         "-r",
         "--random-order",
         action="store_true",
-        help="randomize the order in which repositories are accessed",
+        help="operate on repositories in a randomized order",
+    )
+    order_group.add_argument(
+        "-S",
+        "--sorted",
+        action="store_true",
+        help="operate on repositories in alphabetical order",
     )
 
     parser.add_argument(
@@ -461,19 +576,20 @@ def parse_arguments(argv: Optional[Sequence[str]]) -> argparse.Namespace:
         help="make repository paths absolute before operating on them",
     )
 
-    volume_group = parser.add_mutually_exclusive_group()
-    volume_group.add_argument(
+    parser.add_argument(
         "-v",
         "--verbose",
         action="count",
         default=0,
-        help="increase the verbosity of the script (can be specified up to twice)",
+        help="increase the verbosity of the script",
     )
-    volume_group.add_argument(
+
+    parser.add_argument(
         "-q",
         "--quiet",
-        action="store_true",
-        help="silence all output (cannot be combined with --verbose)",
+        action="count",
+        default=0,
+        help="decrease the verbosity of the script",
     )
 
     traceback_group = parser.add_mutually_exclusive_group()
@@ -481,100 +597,113 @@ def parse_arguments(argv: Optional[Sequence[str]]) -> argparse.Namespace:
         "-t",
         "--traceback",
         action="store_true",
-        help="display tracebacks on error (defaults to True when verbose >= 2)",
+        help="display tracebacks on error (defaults to True when verbosity >= 2)",
     )
     traceback_group.add_argument(
         "-T",
         "--no-traceback",
         action="store_true",
-        help="disable tracebacks (even when verbose >= 2)",
+        help="disable tracebacks (even when verbosity >= 2)",
     )
 
-    args = parser.parse_args(argv)
+    return parser.parse_args(argv)
 
-    # the `no_traceback_log_filter` logic is intentionally long-winded
-    # in order to be more readable
 
-    # disable traceback by default
-    logger.addFilter(no_traceback_log_filter)
+def setup_logging(volume: int, tracebacks: Optional[bool]) -> None:
+    logging.config.dictConfig(LOGGING_CONFIG)
 
-    if args.traceback:
-        logger.removeFilter(no_traceback_log_filter)
+    if volume <= -2:
+        logger.setLevel(logging.FATAL)
+    elif volume <= -1:
+        logger.setLevel(logging.CRITICAL)
+    elif volume <= 0:
+        logger.setLevel(logging.WARNING)
+    elif volume <= 1:
+        logger.setLevel(logging.INFO)
+    elif volume <= 2:
+        logger.setLevel(logging.DEBUG)
 
-    if args.quiet:
-        logger.level = logging.FATAL
-    elif args.verbose >= 2:
-        logger.level = logging.DEBUG
-        # re-enable tracebacks when verbose => 2
-        logger.removeFilter(no_traceback_log_filter)
-        # unless `--no-traceback` is specified
-        if args.no_traceback:
-            logger.addFilter(no_traceback_log_filter)
-    elif args.verbose >= 1:
-        logger.level = logging.INFO
+    if tracebacks is False:
+        logger.addFilter(no_traceback_log_filter)
+    elif tracebacks is None and volume <= 1:
+        logger.addFilter(no_traceback_log_filter)
 
-    return args
+
+def collect_repos(args: argparse.Namespace) -> Generator[Repo]:
+    if args.random_order:
+        args.random_order = False
+        repos = list(collect_repos(args))
+        random.shuffle(repos)
+        yield from repos
+        return
+
+    seen: set[Repo] = set()
+    for directory in args.directories:
+        for repo in Repo.find_recursive(
+            directory, args.depth, args.exclude, args.force_recurse, args.absolute
+        ):
+            if repo in seen:
+                continue
+            seen.add(repo)
+            yield repo
 
 
 def _main_singlethreaded(args: argparse.Namespace) -> bool:
     """update git repositories from remotes, one at a time."""
     failures = False
 
-    for directory in args.directories:
-        repos: list[Repo] = Repo.find_recursive(
-            directory,
-            maxdepth=args.depth,
-            exclude=args.exclude,
-            randomized=args.random_order,
-            force_recurse=args.force_recurse,
-            absolute_paths=args.absolute,
-        )
+    if args.print:
+        for repo in collect_repos(args):
+            print(repo.orig_path)
+        return failures
 
-        if args.print:
-            for repo in repos:
-                print(repo)
-        else:
-            for repo in repos:
-                if args.slow:
-                    time.sleep(1)
-                try:
-                    failures |= repo.update(args.lprune)
-                except Exception as exc:
-                    logger.exception("Trapped error: %s", exc)
-                    failures = True
+    def process(func: Callable[P, bool], *func_args: P.args, **func_kwargs: P.kwargs):
+        nonlocal failures
+        if args.slow:
+            time.sleep(1)
+        try:
+            failures |= func(*func_args, **func_kwargs)
+        except Exception as exc:
+            logger.exception("Caught an exception: %s", exc)
+            failures = True
+
+    linked_worktrees: list[Repo] = []
+    for repo in collect_repos(args):
+        if not repo.is_main_worktree:
+            linked_worktrees.append(repo)
+            continue
+        process(repo.update, args.lprune)
+
+    for repo in linked_worktrees:
+        process(repo.update, args.lprune)
 
     return failures
 
 
 def _main_multithreaded(args: argparse.Namespace) -> bool:
-    executor = MyExecutor(os.cpu_count())
     failures = False
 
-    for directory in args.directories:
-        repos: list[Repo] = Repo.find_recursive(
-            directory,
-            maxdepth=args.depth,
-            exclude=args.exclude,
-            randomized=args.random_order,
-            force_recurse=args.force_recurse,
-            absolute_paths=args.absolute,
-        )
+    with MyExecutor() as executor:
+        linked_worktrees = []
+        for repo in collect_repos(args):
+            if repo.is_main_worktree:
+                executor.submit(repo.update, args.lprune)
+            else:
+                linked_worktrees.append(repo)
 
-        for repo in repos:
-            executor.submit(repo.update, args.lprune)
-
-    try:
         for ftr in as_completed(executor.futures()):
             try:
                 failures |= ftr.result()
             except Exception as exc:
-                logger.exception("Trapped error: %s", exc)
+                logger.exception("Caught an exception: %s", exc)
                 failures = True
-    except KeyboardInterrupt:
-        for ftr in executor.futures():
-            ftr.cancel()
-    finally:
-        executor.shutdown()
+
+        for repo in linked_worktrees:
+            try:
+                repo.update_checked_out_branch()
+            except Exception as exc:
+                logger.exception("Caught an exception: %s", exc)
+                failures = True
 
     return failures
 
@@ -583,6 +712,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     """Update git repositories from remotes."""
 
     args = parse_arguments(argv)
+    setup_logging(volume=args.verbose - args.quiet, tracebacks=args.traceback)
 
     os.environ["GIT_ASKPASS"] = "echo"
 
@@ -592,8 +722,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         else:
             failures = _main_multithreaded(args)
     except KeyboardInterrupt:
-        print("Caught interrupt")
-        exit(0)
+        logger.warning("Caught interrupt")
+        exit(1)
 
     exit(failures)
 
