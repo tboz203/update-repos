@@ -18,7 +18,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from contextvars import ContextVar
 from itertools import chain
-from typing import Any, Optional, ParamSpec, Self, TypeAlias, TypeVar, Union
+from typing import Any, ParamSpec, Self, TypeAlias, TypeVar
 
 import git
 
@@ -32,16 +32,17 @@ __all__ = [
 ]
 
 T = TypeVar("T")
+C = TypeVar("C", bound=Callable)
 P = ParamSpec("P")
 
 # akin to `Optional`, but with Exceptions instead of `None`
-ExceptionOr: TypeAlias = Union[Exception, T]
+ExceptionOr: TypeAlias = Exception | T
 
 # the triplets that `os.walk` & friends yield
 WalkEntry: TypeAlias = tuple[str, list[str], list[str]]
 
 # things that resolve to a commit
-CommitRef: TypeAlias = Union[git.Commit, git.Tag, git.Head]
+CommitRef: TypeAlias = git.Commit | git.Tag | git.Head
 
 FETCHINFO_FLAGS = {
     git.FetchInfo.ERROR: "ERROR",
@@ -54,7 +55,7 @@ FETCHINFO_FLAGS = {
     git.FetchInfo.TAG_UPDATE: "TAG_UPDATE",
 }
 
-REPO_DIR: ContextVar[Optional[str]] = ContextVar("REPO_DIR", default=None)
+REPO_DIR: ContextVar[str | None] = ContextVar("REPO_DIR", default=None)
 
 logger = logging.getLogger("update-repos")
 
@@ -86,11 +87,12 @@ class MyExecutor(ThreadPoolExecutor):
         super().__init__(*args, **kwargs)
         self._futures = []
 
-    def submit(self, *args, **kwargs) -> Future:
-        ftr = super().submit(*args, **kwargs)
+    def submit(self, fn: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> Future[T]:
+        ftr = super().submit(fn, *args, **kwargs)
         self._futures.append(ftr)
         return ftr
 
+    @property
     def futures(self) -> Generator[Future]:
         yield from self._futures
 
@@ -101,14 +103,15 @@ class Repo(git.Repo):
     def __init__(self, path: str, *args, **kwargs):
         super().__init__(path, *args, **kwargs)
         self.orig_path = path
-        self._sibling_worktrees: Optional[list[Self]] = None
+        self._sibling_worktrees: list[Self] | None = None
 
     @classmethod
     def find_recursive(
         cls,
-        path: str,
-        max_depth: Optional[int] = None,
-        exclude: Iterable[str] = (),
+        starting_path: str,
+        *,
+        max_depth: int | None = None,
+        exclude: Iterable[str] | None = None,
         include_ancestors: bool = True,
         force_recurse: bool = False,
         absolute_paths: bool = False,
@@ -124,30 +127,30 @@ class Repo(git.Repo):
         `absolute_paths` is True.
         """
 
-        path = os.path.abspath(path) if absolute_paths else os.path.normpath(path)
-        logger.debug("%s: finding git repositories: (maxdepth=%s)", path, max_depth)
+        starting_path = os.path.abspath(starting_path) if absolute_paths else os.path.normpath(starting_path)
+        logger.debug("%s: finding git repositories: (maxdepth=%s)", starting_path, max_depth)
 
-        walk_generator = depthwalk(path, maxdepth=max_depth)
+        walk_generator = depthwalk(starting_path, maxdepth=max_depth)
         if include_ancestors:
-            walk_generator = chain(walk_generator, backwalk(path))
+            walk_generator = chain(walk_generator, backwalk(starting_path))
 
-        exclusion_patterns = cls._build_exclusion_patterns(exclude)
+        exclusion_patterns = cls._build_exclusion_patterns(exclude) if exclude else []
 
-        for directory, child_dirs, child_files in walk_generator:
-            if any(fnmatch.fnmatch(directory, pat) for pat in exclusion_patterns):
-                logger.debug("Excluding path: %s", directory)
+        for path, dirs, files in walk_generator:
+            if any(fnmatch.fnmatch(path, pat) for pat in exclusion_patterns):
+                logger.debug("Excluding path: %s", path)
                 # clearing `dirs` prevents `os.walk` (and hence `depthwalk`)
                 # from traversing any deeper, but doesn't affect `backwalk`
-                child_dirs.clear()
+                dirs.clear()
                 continue
 
-            if ".git" in child_dirs or ".git" in child_files:
+            if ".git" in dirs or ".git" in files:
                 try:
-                    yield cls(directory)
+                    yield cls(path)
                 except git.GitError as exc:
                     logger.warning("Skipping path: %r", exc)
                 if not force_recurse:
-                    child_dirs.clear()
+                    dirs.clear()
                     continue
 
     @staticmethod
@@ -171,18 +174,19 @@ class Repo(git.Repo):
                 exclusions.add(os.path.normpath(pattern))
             else:
                 exclusions.add("*/" + pattern)
+
         return list(exclusions)
 
     def is_ancestor(self, ancestor_rev: CommitRef, rev: CommitRef) -> bool:
         return super().is_ancestor(ancestor_rev, rev)  # type: ignore
 
-    def update(self, lprune: bool = False) -> bool:
+    def update(self, *, lprune: bool = False) -> bool:
         with context(REPO_DIR, self.orig_path):
             logger.info("Updating repository")
             failures = False
             if self.is_main_worktree:
                 failures |= self.update_remotes()
-                failures |= self.update_branches(lprune)
+                failures |= self.update_branches(lprune=lprune)
             else:
                 failures |= self.update_checked_out_branch()
             return failures
@@ -222,20 +226,20 @@ class Repo(git.Repo):
                     )
             return failures
 
-    def update_branches(self, lprune: bool = False) -> bool:
+    def update_branches(self, *, lprune: bool = False) -> bool:
         """update all local branches from their respective tracking branches (if set)."""
         with context(REPO_DIR, self.orig_path):
             failures = False
             for branch in self.branches:
                 try:
-                    failures |= self.update_branch(branch, lprune)
+                    failures |= self.update_branch(branch, lprune=lprune)
                 except Exception as exc:
                     logger.exception("Failed to update branch: %s (%s)", branch, exc)
                     failures = True
 
             return failures
 
-    def update_branch(self, branch: git.Head, lprune: bool = False) -> bool:
+    def update_branch(self, branch: git.Head, *, lprune: bool = False) -> bool:
         """fast-forward the given local branch from its tracking branch, if set."""
         with context(REPO_DIR, self.orig_path):
             failure = False
@@ -268,9 +272,7 @@ class Repo(git.Repo):
                     logger.info("skipping branch checked out elsewhere: %s", branch)
                 elif self.is_dirty():
                     failure = True
-                    logger.warning(
-                        "Refusing to update dirty checked out branch: %s", branch
-                    )
+                    logger.warning("Refusing to update dirty checked out branch: %s", branch)
                 else:
                     logger.info("fast-forwarding checked out branch: %s", branch)
                     self.head.reset(tracking_branch, index=True, working_tree=True)
@@ -332,10 +334,7 @@ class Repo(git.Repo):
                 worktrees.append(worktree)
 
         if self not in worktrees:
-            raise RuntimeError(
-
-                "Own worktree not found in worktrees list", self, porcelain
-            )
+            raise RuntimeError("Own worktree not found in worktrees list", self, porcelain)
 
         for worktree in worktrees:
             worktree.worktrees = worktrees
@@ -343,11 +342,9 @@ class Repo(git.Repo):
         return self.worktrees
 
     @worktrees.setter
-    def worktrees(self, worktrees):
+    def worktrees(self, worktrees: list[Self]):
         if self not in worktrees:
-            raise ValueError(
-                "Repo must be among its own sibling worktrees", self, worktrees
-            )
+            raise ValueError("Repo must be among its own sibling worktrees", self, worktrees)
         self._sibling_worktrees = list(worktrees)
 
     @property
@@ -375,26 +372,22 @@ class Repo(git.Repo):
             result = f"({remote_ref}) {result}"
         if fetchinfo.flags & (git.FetchInfo.FORCED_UPDATE | git.FetchInfo.FAST_FORWARD):
             result = f"{result} <- {fetchinfo.old_commit}"
-        flag_list = [
-            flag_name
-            for flag, flag_name in FETCHINFO_FLAGS.items()
-            if flag & fetchinfo.flags
-        ]
+        flag_list = [flag_name for flag, flag_name in FETCHINFO_FLAGS.items() if flag & fetchinfo.flags]
         flags = " | ".join(flag_list)
         result = f"{result} ({flags})"
         return result
 
     @classmethod
     def fetchinfolist_to_str(
-        cls, fetchinfolist: list[git.FetchInfo], indent=4, show_all=False
+        cls,
+        fetchinfolist: list[git.FetchInfo],
+        *,
+        indent: int = 4,
+        show_all: bool = False,
     ) -> str:
         # remove boring items
         if not show_all:
-            fetchinfolist = [
-                item
-                for item in fetchinfolist
-                if item.flags ^ git.FetchInfo.HEAD_UPTODATE
-            ]
+            fetchinfolist = [item for item in fetchinfolist if item.flags ^ git.FetchInfo.HEAD_UPTODATE]
         # short-circuit for boring lists
         if not fetchinfolist:
             return "[]"
@@ -408,19 +401,20 @@ class Repo(git.Repo):
 
 
 def depthwalk(
-    top: str,
+    starting_path: str,
+    onerror: Callable[[OSError], Any] | None = None,
     topdown: bool = True,
-    onerror: Optional[Callable[[OSError], Any]] = None,
     followlinks: bool = False,
-    maxdepth: Optional[int] = None,
+    maxdepth: int | None = None,
 ) -> Generator[WalkEntry]:
     """just like `os.walk`, but with new added `maxdepth` parameter!"""
+    walk_generator = os.walk(top=starting_path, topdown=topdown, onerror=onerror, followlinks=followlinks)
     if maxdepth is None:
-        yield from os.walk(top, topdown, onerror, followlinks)
+        yield from walk_generator
         return
 
-    depthmap = {top: 0}
-    for path, dirs, files in os.walk(top, topdown, onerror, followlinks):
+    depthmap = {starting_path: 0}
+    for path, dirs, files in walk_generator:
         yield path, dirs, files
         here = depthmap[path]
         if here >= maxdepth:
@@ -431,9 +425,9 @@ def depthwalk(
             depthmap[child] = here + 1
 
 
-def backwalk(top: str) -> Generator[WalkEntry]:
-    """just like `os.walk`, but goes up instead of down"""
-    curr = os.path.abspath(top)
+def backwalk(starting_path: str) -> Generator[WalkEntry]:
+    """similar to `os.walk`, but goes up instead of down"""
+    curr = os.path.abspath(starting_path)
     while True:
         parent = os.path.dirname(curr)
         if not parent or curr == parent:
@@ -449,6 +443,7 @@ def backwalk(top: str) -> Generator[WalkEntry]:
 
 @contextmanager
 def context(var: ContextVar[T], value: T):
+    """Set a context variable within a context block."""
     token = var.set(value)
     try:
         yield
@@ -456,7 +451,7 @@ def context(var: ContextVar[T], value: T):
         var.reset(token)
 
 
-def parse_arguments(argv: Optional[Sequence[str]]) -> argparse.Namespace:
+def parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "directories",
@@ -465,7 +460,10 @@ def parse_arguments(argv: Optional[Sequence[str]]) -> argparse.Namespace:
         help="directories to search for repositories (defaults to current directory)",
     )
     parser.add_argument(
-        "-d", "--depth", type=int, help="maximum depth to search for repositories"
+        "-d",
+        "--depth",
+        type=int,
+        help="maximum depth to search for repositories",
     )
     parser.add_argument(
         "-e",
@@ -576,7 +574,7 @@ def parse_arguments(argv: Optional[Sequence[str]]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def setup_logging(quiet: int, verbose: int, tracebacks: Optional[bool]) -> None:
+def setup_logging(quiet: int, verbose: int, tracebacks: bool | None) -> None:
     volume = verbose - quiet
 
     # if volume <= -2:
@@ -590,7 +588,7 @@ def setup_logging(quiet: int, verbose: int, tracebacks: Optional[bool]) -> None:
     # elif volume <= 2:
     #     level = logging.DEBUG
 
-    level = logging.WARNING + (volume * 10)
+    level = logging.WARNING - (volume * 10)
     level = min(max(logging.DEBUG, level), logging.FATAL)
 
     filters = []
@@ -618,7 +616,6 @@ def setup_logging(quiet: int, verbose: int, tracebacks: Optional[bool]) -> None:
             },
             "handlers": {
                 "console": {
-                    "level": level,
                     "formatter": "standard",
                     "filters": ["repo_dir_context"] + filters,
                     "class": "logging.StreamHandler",
@@ -627,7 +624,7 @@ def setup_logging(quiet: int, verbose: int, tracebacks: Optional[bool]) -> None:
             "loggers": {
                 "update-repos": {
                     "handlers": ["console"],
-                    "level": "WARNING",
+                    "level": level,
                     "propagate": False,
                 },
             },
@@ -646,7 +643,12 @@ def collect_repos(args: argparse.Namespace) -> Generator[Repo]:
     seen: set[Repo] = set()
     for directory in args.directories:
         for repo in Repo.find_recursive(
-            directory, args.depth, args.exclude, args.force_recurse, args.absolute
+            starting_path=directory,
+            max_depth=args.depth,
+            exclude=args.exclude,
+            include_ancestors=True,
+            force_recurse=args.force_recurse,
+            absolute_paths=args.absolute,
         ):
             if repo in seen:
                 continue
@@ -660,10 +662,12 @@ def _single_threaded_main(args: argparse.Namespace) -> bool:
     Returns a boolean indicating whether errors occurred.
     """
 
+    any_errors = False
+
     if args.print:
         for repo in collect_repos(args):
             print(repo.orig_path)
-        return False
+        return any_errors
 
     def process(func: Callable[P, bool], *func_args: P.args, **func_kwargs: P.kwargs):
         if args.slow:
@@ -679,48 +683,50 @@ def _single_threaded_main(args: argparse.Namespace) -> bool:
         if not repo.is_main_worktree:
             linked_worktrees.append(repo)
             continue
-        process(repo.update, args.lprune)
+        any_errors |= process(repo.update, lprune=args.lprune)
 
     for repo in linked_worktrees:
-        process(repo.update, args.lprune)
+        any_errors |= process(repo.update, lprune=args.lprune)
 
-    return failures
+    return any_errors
 
 
 def _multi_threaded_main(args: argparse.Namespace) -> bool:
     """update git repositories from remotes in parallel."""
-    failures = False
+    any_errors = False
     linked_worktrees = []
 
     with MyExecutor() as executor:
         for repo in collect_repos(args):
             if repo.is_main_worktree:
-                executor.submit(repo.update, args.lprune)
+                executor.submit(repo.update, lprune=args.lprune)
             else:
                 linked_worktrees.append(repo)
 
-        for ftr in as_completed(executor.futures()):
+        for ftr in as_completed(executor.futures):
             try:
-                failures |= ftr.result()
+                any_errors |= ftr.result()
             except Exception as exc:
                 logger.exception("Caught an exception: %s", exc)
-                failures = True
+                any_errors = True
 
         for repo in linked_worktrees:
             try:
                 repo.update_checked_out_branch()
             except Exception as exc:
                 logger.exception("Caught an exception: %s", exc)
-                failures = True
+                any_errors = True
 
-    return failures
+    return any_errors
 
 
-def main(argv: Optional[Sequence[str]] = None) -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     """Update git repositories from remotes."""
 
     args = parse_arguments(argv)
     setup_logging(args.quiet, args.verbose, args.traceback)
+
+    logger.debug("Args: %r", args)
 
     os.environ["GIT_ASKPASS"] = "echo"
 
