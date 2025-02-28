@@ -1,48 +1,35 @@
-#!/usr/local/bin/python3
-
-"""
-Update git repositories from remotes.
-"""
+#!/home/th026106/.pyenv/versions/update-repos/bin/python
+"""Update git repositories from remotes."""
 
 from __future__ import annotations
 
 import argparse
+import copy
 import fnmatch
 import logging
 import logging.config
-import os
 import random
+import re
 import time
-from collections.abc import Callable, Generator, Iterable, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from itertools import chain
-from typing import Any, ParamSpec, Self, TypeAlias, TypeVar
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal, Self
 
 import git
 
-__all__ = [
-    "MyExecutor",
-    "Repo",
-    "no_traceback_log_filter",
-    "depthwalk",
-    "parse_arguments",
-    "main",
-]
+if TYPE_CHECKING:
+    from collections.abc import Callable, Generator, Iterable, Sequence
+    from concurrent.futures import Future
 
-T = TypeVar("T")
-C = TypeVar("C", bound=Callable)
-P = ParamSpec("P")
+    # the triplets that `os.walk` & friends yield
+    type WalkEntry[T: (str, Path)] = tuple[T, list[str], list[str]]
 
-# akin to `Optional`, but with Exceptions instead of `None`
-ExceptionOr: TypeAlias = Exception | T
-
-# the triplets that `os.walk` & friends yield
-WalkEntry: TypeAlias = tuple[str, list[str], list[str]]
-
-# things that resolve to a commit
-CommitRef: TypeAlias = git.Commit | git.Tag | git.Head
+    # things that resolve to a commit
+    type CommitRef = git.Commit | git.Tag | git.Head
 
 FETCHINFO_FLAGS = {
     git.FetchInfo.ERROR: "ERROR",
@@ -60,23 +47,50 @@ REPO_DIR: ContextVar[str | None] = ContextVar("REPO_DIR", default=None)
 logger = logging.getLogger("update-repos")
 
 
+@dataclass(frozen=True)
+class Settings:
+    """A dataclass to encapsulate script settings."""
+
+    directories: tuple[str, ...]
+    exclude: tuple[str, ...]
+
+    depth: int | None
+    verbosity: int
+
+    absolute: bool
+    follow: bool
+    lprune: bool
+    print: bool
+    recurse: bool
+    single_thread: bool
+    search_hidden: bool
+    search_caches: bool
+    slow: bool
+    log_tracebacks: bool
+
+    order: Literal["random", "alphabetical"] | None
+
+
 class ContextAddedLogFilter(logging.Filter):
     """A logging filter that populates a LogRecord attribute from a ContextVar."""
 
-    def __init__(self, *args, var: ContextVar, attribute: str, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, *, var: ContextVar, attribute: str):
         self.var = var
         self.attribute = attribute
 
     def filter(self, record: logging.LogRecord) -> bool:
         setattr(record, self.attribute, self.var.get())
-        return super().filter(record)
+        return True
 
 
-def no_traceback_log_filter(record: logging.LogRecord) -> bool:
-    """log filter function to unconditionally remove exception info"""
-    record.exc_info = None
-    return True
+class NoTracebackLogFilter(logging.Filter):
+    """A log filter that unconditionally removes exception info."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Remove exception info from a log record"""
+        record.exc_info = None
+
+        return True
 
 
 class MyExecutor(ThreadPoolExecutor):
@@ -87,7 +101,9 @@ class MyExecutor(ThreadPoolExecutor):
         super().__init__(*args, **kwargs)
         self._futures = []
 
-    def submit(self, fn: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> Future[T]:
+    def submit[**P, T](
+        self, fn: Callable[P, T], *args: P.args, **kwargs: P.kwargs
+    ) -> Future[T]:
         ftr = super().submit(fn, *args, **kwargs)
         self._futures.append(ftr)
         return ftr
@@ -100,21 +116,24 @@ class MyExecutor(ThreadPoolExecutor):
 class Repo(git.Repo):
     """Just like git.Repo, but with more"""
 
-    def __init__(self, path: str, *args, **kwargs):
-        super().__init__(path, *args, **kwargs)
-        self.orig_path = path
-        self._sibling_worktrees: list[Self] | None = None
+    def __init__(self, path: str | Path, *args, **kwargs):
+        super().__init__(Path(path).resolve(), *args, **kwargs)
+        self.orig_path = str(path)
+        self._worktrees: list[Self] | None = None
 
     @classmethod
     def find_recursive(
         cls,
-        starting_path: str,
+        starting_path: str | Path,
         *,
         max_depth: int | None = None,
         exclude: Iterable[str] | None = None,
         include_ancestors: bool = True,
-        force_recurse: bool = False,
+        recurse_repositories: bool = False,
         absolute_paths: bool = False,
+        follow_symlinks: bool = True,
+        search_hidden: bool = False,
+        search_caches: bool = False,
     ) -> Generator[Self]:
         """
         Enumerate Git Repositories.
@@ -122,22 +141,46 @@ class Repo(git.Repo):
         Search first in and beneath the given `path` (optionally limited to a
         maximum depth), and then optionally also upwards through the path's
         ancestors. Skip searching paths matching optional wildcard exclusion
-        patterns. Do not recurse into found repositories unless `force_recurse`
-        is True. Build enumerated repositories from relative paths unless
-        `absolute_paths` is True.
+        patterns. Do not recurse into found repositories unless
+        `recurse_repositories` is True. Build enumerated repositories from
+        relative paths unless `absolute_paths` is True.
         """
 
-        starting_path = os.path.abspath(starting_path) if absolute_paths else os.path.normpath(starting_path)
-        logger.debug("%s: finding git repositories: (maxdepth=%s)", starting_path, max_depth)
+        starting_path = Path(starting_path)
+        if absolute_paths:
+            starting_path = starting_path.resolve()
 
-        walk_generator = depthwalk(starting_path, maxdepth=max_depth)
+        logger.debug(
+            "%s: finding git repositories: (maxdepth=%s)", starting_path, max_depth
+        )
+
+        walk_generator = depthwalk(
+            starting_path, max_depth=max_depth, follow_symlinks=follow_symlinks
+        )
         if include_ancestors:
             walk_generator = chain(walk_generator, backwalk(starting_path))
 
-        exclusion_patterns = cls._build_exclusion_patterns(exclude) if exclude else []
+        exclude = tuple(exclude) if exclude else ()
+        exclude += () if search_hidden else (".*",)
+        exclusion_patterns = cls._build_exclusion_patterns(exclude)
+
+        def should_exclude(
+            path: str | Path, dirs: Iterable[str | Path], files: Iterable[str | Path]
+        ) -> bool:
+            """Test whether or not the current path should be excluded from the walk."""
+
+            del dirs, files
+
+            if any(fnmatch.fnmatch(str(path), pat) for pat in exclusion_patterns):
+                return True
+
+            if not search_caches and is_cache(path):
+                return True
+
+            return False
 
         for path, dirs, files in walk_generator:
-            if any(fnmatch.fnmatch(path, pat) for pat in exclusion_patterns):
+            if should_exclude(path, dirs, files):
                 logger.debug("Excluding path: %s", path)
                 # clearing `dirs` prevents `os.walk` (and hence `depthwalk`)
                 # from traversing any deeper, but doesn't affect `backwalk`
@@ -149,7 +192,7 @@ class Repo(git.Repo):
                     yield cls(path)
                 except git.GitError as exc:
                     logger.warning("Skipping path: %r", exc)
-                if not force_recurse:
+                if not recurse_repositories:
                     dirs.clear()
                     continue
 
@@ -171,7 +214,7 @@ class Repo(git.Repo):
             if pattern in (".", ".."):
                 pattern += "/"
             if any(pattern.startswith(prefix) for prefix in ("./", "../", "/")):
-                exclusions.add(os.path.normpath(pattern))
+                exclusions.add(pattern)
             else:
                 exclusions.add("*/" + pattern)
 
@@ -192,6 +235,32 @@ class Repo(git.Repo):
             return failures
 
     def update_remotes(self) -> bool:
+        """Fetch from all remotes, and return a bool indicating failures."""
+        with context(REPO_DIR, self.orig_path):
+            failures = False
+            for remote in self.remotes:
+                if remote.config_reader.get("skipFetchAll", fallback=None):
+                    logger.debug("skipping: %s", remote)
+                    continue
+                logger.debug("fetching: %s", remote)
+                try:
+                    fetchinfolist = remote.fetch()
+                except git.GitCommandError as exc:
+                    logger.error(exc)
+                    failures = True
+                except Exception:
+                    logger.exception("Failed to fetch: %s", remote)
+                    failures = True
+                else:
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            "fetchinfolist: %s: %s",
+                            remote,
+                            self.fetchinfolist_to_str(fetchinfolist),
+                        )
+            return failures
+
+    def _update_remotes(self) -> bool:
         with context(REPO_DIR, self.orig_path):
             failures = False
             for remote in self.remotes:
@@ -205,7 +274,7 @@ class Repo(git.Repo):
                         fetchinfolist = remote.fetch()
                         break
                     except git.GitCommandError as exc:
-                        logger.exception("%s", exc)
+                        logger.error(exc)
                         if time.monotonic() - start > 120:
                             logger.error("caught the thing too many times; giving up")
                             failures = True
@@ -246,7 +315,7 @@ class Repo(git.Repo):
             checked_out = self.branch_is_checked_out_anywhere(branch)
             tracking_branch = branch.tracking_branch()
             if tracking_branch is None:
-                logger.info("no tracking branch set: %s", branch)
+                logger.debug("no tracking branch set: %s", branch)
             elif not tracking_branch.is_valid():
                 if (not checked_out) and lprune:
                     logger.info("Pruning local branch: %s", branch)
@@ -272,13 +341,15 @@ class Repo(git.Repo):
                     logger.info("skipping branch checked out elsewhere: %s", branch)
                 elif self.is_dirty():
                     failure = True
-                    logger.warning("Refusing to update dirty checked out branch: %s", branch)
+                    logger.warning(
+                        "Refusing to update dirty checked out branch: %s", branch
+                    )
                 else:
-                    logger.info("fast-forwarding checked out branch: %s", branch)
+                    logger.debug("fast-forwarding checked out branch: %s", branch)
                     self.head.reset(tracking_branch, index=True, working_tree=True)
             else:
                 branch.commit = tracking_branch.commit
-                logger.info("Updated branch: %s", branch)
+                logger.debug("Updated branch: %s", branch)
             return failure
 
     def update_checked_out_branch(self) -> bool:
@@ -286,66 +357,73 @@ class Repo(git.Repo):
         with context(REPO_DIR, self.orig_path):
             failure = False
             if self.head.is_detached:
-                logger.info("repo is in detached state")
+                logger.info("Skipping repo in detached state")
             elif not isinstance(self.head.ref, git.Head):
                 logger.warning("%s: HEAD not pointed at a Head?: %s", self.head.ref)
             else:
                 failure = self.update_branch(self.head.ref)
             return failure
 
-    @property
-    def worktrees(self) -> list[Self]:
-        """
-        given a git Repo, return a list of Repos representing all worktrees related
-        to that Repo (including the passed Repo)
-        """
-        if self._sibling_worktrees:
-            return self._sibling_worktrees
+    def _find_worktrees(self) -> list[Self]:
+        """Collect the Repos of worktrees related to this Repo."""
 
         porcelain: str = self.git.worktree("list", "--porcelain")
-
-        # key-value pairs related to a single worktree
-        parts = {}
-        # a collection of parts
-        parts_list = [parts]
-        for line in porcelain.splitlines():
-            if not line:
-                # start of a new group of parts
-                parts = {}
-                parts_list.append(parts)
-                continue
-            lineparts = line.split(" ", maxsplit=1)
-            if len(lineparts) == 2:
-                key, value = lineparts
-            else:
-                key, value = line, True
-            parts[key] = value
+        raw_worktrees = _parse_porcelain_key_value_stanzas(porcelain)
 
         worktrees = []
         RepoType = type(self)
-        for parts in parts_list:
-            worktree_dir = parts.get("worktree")
+        for worktree_values in raw_worktrees:
+            worktree_dir = worktree_values.get("worktree")
             if not worktree_dir:
-                logger.warning("Malformed worktree: %s", parts)
+                logger.warning("Malformed worktree: %s", worktree_values)
             elif worktree_dir == self.working_dir:
                 worktrees.append(self)
             else:
+                assert isinstance(worktree_dir, str)
+                worktree = RepoType(worktree_dir)
+                worktrees.append(worktree)
+
+        return worktrees
+
+    @property
+    def worktrees(self) -> list[Self]:
+        """The list of Repos for all worktrees related to this Repo (including this one)."""
+        if self._worktrees is not None:
+            return self._worktrees
+
+        porcelain: str = self.git.worktree("list", "--porcelain")
+        raw_worktrees = _parse_porcelain_key_value_stanzas(porcelain)
+
+        worktrees = []
+        RepoType = type(self)
+        for worktree_values in raw_worktrees:
+            worktree_dir = worktree_values.get("worktree")
+            if not worktree_dir:
+                logger.warning("Malformed worktree: %s", worktree_values)
+            elif worktree_dir == self.working_dir:
+                worktrees.append(self)
+            else:
+                assert isinstance(worktree_dir, str)
                 worktree = RepoType(worktree_dir)
                 worktrees.append(worktree)
 
         if self not in worktrees:
-            raise RuntimeError("Own worktree not found in worktrees list", self, porcelain)
+            raise RuntimeError(
+                "Own worktree not found in worktrees list", self, porcelain
+            )
 
         for worktree in worktrees:
             worktree.worktrees = worktrees
 
-        return self.worktrees
+        return worktrees
 
     @worktrees.setter
     def worktrees(self, worktrees: list[Self]):
         if self not in worktrees:
-            raise ValueError("Repo must be among its own sibling worktrees", self, worktrees)
-        self._sibling_worktrees = list(worktrees)
+            raise ValueError(
+                "Repo must be among its own sibling worktrees", self, worktrees
+            )
+        self._worktrees = list(worktrees)
 
     @property
     def is_main_worktree(self) -> bool:
@@ -353,7 +431,7 @@ class Repo(git.Repo):
 
     def branch_is_checked_out_anywhere(self, branch: git.Head) -> bool:
         """
-        find out whether this branch is checked out in this worktree or any related
+        Find out whether this branch is checked out in this worktree or any related
         worktree
         """
 
@@ -372,7 +450,11 @@ class Repo(git.Repo):
             result = f"({remote_ref}) {result}"
         if fetchinfo.flags & (git.FetchInfo.FORCED_UPDATE | git.FetchInfo.FAST_FORWARD):
             result = f"{result} <- {fetchinfo.old_commit}"
-        flag_list = [flag_name for flag, flag_name in FETCHINFO_FLAGS.items() if flag & fetchinfo.flags]
+        flag_list = [
+            flag_name
+            for flag, flag_name in FETCHINFO_FLAGS.items()
+            if flag & fetchinfo.flags
+        ]
         flags = " | ".join(flag_list)
         result = f"{result} ({flags})"
         return result
@@ -387,7 +469,11 @@ class Repo(git.Repo):
     ) -> str:
         # remove boring items
         if not show_all:
-            fetchinfolist = [item for item in fetchinfolist if item.flags ^ git.FetchInfo.HEAD_UPTODATE]
+            fetchinfolist = [
+                item
+                for item in fetchinfolist
+                if item.flags ^ git.FetchInfo.HEAD_UPTODATE
+            ]
         # short-circuit for boring lists
         if not fetchinfolist:
             return "[]"
@@ -401,15 +487,18 @@ class Repo(git.Repo):
 
 
 def depthwalk(
-    starting_path: str,
-    onerror: Callable[[OSError], Any] | None = None,
-    topdown: bool = True,
-    followlinks: bool = False,
-    maxdepth: int | None = None,
-) -> Generator[WalkEntry]:
+    starting_path: str | Path,
+    onerror: Callable[[OSError], object] | None = None,
+    top_down: bool = True,
+    follow_symlinks: bool = True,
+    max_depth: int | None = None,
+) -> Generator[WalkEntry[Path]]:
     """just like `os.walk`, but with new added `maxdepth` parameter!"""
-    walk_generator = os.walk(top=starting_path, topdown=topdown, onerror=onerror, followlinks=followlinks)
-    if maxdepth is None:
+    starting_path = Path(starting_path)
+    walk_generator = starting_path.walk(
+        top_down=top_down, on_error=onerror, follow_symlinks=follow_symlinks
+    )
+    if max_depth is None:
         yield from walk_generator
         return
 
@@ -417,32 +506,43 @@ def depthwalk(
     for path, dirs, files in walk_generator:
         yield path, dirs, files
         here = depthmap[path]
-        if here >= maxdepth:
+        if here >= max_depth:
             dirs.clear()
             continue
         for dir in dirs:
-            child = os.path.join(path, dir)
-            depthmap[child] = here + 1
+            depthmap[path / dir] = here + 1
 
 
-def backwalk(starting_path: str) -> Generator[WalkEntry]:
+def backwalk(starting_path: str | Path) -> Generator[WalkEntry[Path]]:
     """similar to `os.walk`, but goes up instead of down"""
-    curr = os.path.abspath(starting_path)
-    while True:
-        parent = os.path.dirname(curr)
-        if not parent or curr == parent:
-            break
-        curr = parent
-
+    for path in Path(starting_path).parents:
         dirs, files = [], []
-        for item in os.scandir(curr):
-            (dirs if item.is_dir() else files).append(item.name)
+        for item in path.iterdir():
+            place = dirs if item.is_dir() else files
+            place.append(item.name)
 
-        yield curr, dirs, files
+        yield path, dirs, files
+
+
+def is_cache(path: str | Path) -> bool:
+    """Decide whether a given path is a cache directory."""
+    path = Path(path)
+    if re.match(r"^(\W|_)*cache(\W|_)*$", path.name, re.IGNORECASE):
+        return True
+
+    cachedir_tag = path / "CACHEDIR.TAG"
+    if cachedir_tag.is_file(follow_symlinks=False):
+        signature = b"Signature: 8a477f597d28d172789f06886806bc55"
+        with cachedir_tag.open("rb") as fin:
+            header = fin.read(len(signature))
+        if header == signature:
+            return True
+
+    return False
 
 
 @contextmanager
-def context(var: ContextVar[T], value: T):
+def context[T](var: ContextVar[T], value: T):
     """Set a context variable within a context block."""
     token = var.set(value)
     try:
@@ -451,7 +551,34 @@ def context(var: ContextVar[T], value: T):
         var.reset(token)
 
 
-def parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
+def _parse_porcelain_key_value_stanzas(
+    porcelain_text: str,
+) -> list[dict[str, str | bool]]:
+    """Parse porcelain command key/value stanzas into a list of dicts."""
+    # keeping track of the current stanza and the list of all stanzas, we go
+    # line by line through our input collecting key value pairs
+
+    current_stanza = {}
+    stanzas = [current_stanza]
+
+    for line in porcelain_text.splitlines():
+        # stanzas are separated by blank lines
+        if not line:
+            current_stanza = {}
+            stanzas.append(current_stanza)
+            continue
+        # stanza lines are either key value pairs, or bare keys
+        lineparts = line.split(" ", maxsplit=1)
+        if len(lineparts) == 2:
+            key, value = lineparts
+        else:
+            key, value = line, True
+        current_stanza[key] = value
+
+    return stanzas
+
+
+def parse_arguments(argv: Sequence[str] | None) -> Settings:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "directories",
@@ -472,130 +599,126 @@ def parse_arguments(argv: Sequence[str] | None) -> argparse.Namespace:
         help="directories to exclude from consideration; may be repeated; accepts wildcards (remember to quote them!)",
     )
     parser.add_argument(
+        "-E",
+        "--everywhere",
+        action="count",
+        default=0,
+        help="don't skip hidden directories; if given twice, also don't skip caches",
+    )
+    parser.add_argument(
         "-R",
-        "--force-recurse",
-        action="store_true",
+        "--recurse-repositories",
+        action=argparse.BooleanOptionalAction,
         help="recurse into repositories, updating submodules & simple nested repositories",
     )
     parser.add_argument(
         "-1",
         "--single-thread",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         help="Run in a single thread. useful for background tasks, or debugging.",
     )
-
-    # action_group = parser.add_mutually_exclusive_group()
-    # action_group.add_argument(
-    #     "-u",
-    #     "--update",
-    #     action="store_true",
-    #     default=True,
-    #     help="update repositories (the default)",
-    # )
-    # action_group.add_argument(
-    #     "-s",
-    #     "--status",
-    #     action="store_true",
-    #     help="report the status of located repositories",
-    # )
-
     parser.add_argument(
         "-p",
         "--print",
-        action="store_true",
-        help="don't update; print the paths of located repositories",
+        action=argparse.BooleanOptionalAction,
+        help="Don't update anything; just print the paths of located repositories",
     )
-
     parser.add_argument(
         "-l",
         "--lprune",
-        action="store_true",
-        help="If a local branch tracks a remote branch that no longer exists, prune the local branch",
+        action=argparse.BooleanOptionalAction,
+        help="Prune local branches tracking remote branches that no longer exist",
     )
-
     parser.add_argument(
         "-s",
         "--slow",
-        action="store_true",
-        help="try to avoid ratelimit. implies `--single-thread`",
+        action=argparse.BooleanOptionalAction,
+        help="Try to avoid ratelimit. Implies `--single-thread`",
+    )
+    parser.add_argument(
+        "-a",
+        "--absolute",
+        action=argparse.BooleanOptionalAction,
+        help="Make repository paths absolute before operating on them",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Increase the verbosity of the script",
+    )
+    parser.add_argument(
+        "-q",
+        "--quiet",
+        action="count",
+        default=0,
+        help="Decrease the verbosity of the script",
+    )
+    parser.add_argument(
+        "-L",
+        "--follow",
+        "--dereference",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Follow symbolic links",
+    )
+    parser.add_argument(
+        "-t",
+        "--tracebacks",
+        action=argparse.BooleanOptionalAction,
+        help="Display tracebacks on error (defaults to True when verbosity >= 2)",
     )
 
     order_group = parser.add_mutually_exclusive_group()
     order_group.add_argument(
         "-r",
         "--random-order",
-        action="store_true",
-        help="operate on repositories in a randomized order",
+        dest="order",
+        action="store_const",
+        const="random",
+        default=None,
+        help="Operate on repositories in a randomized order",
     )
     order_group.add_argument(
         "-S",
         "--sorted",
-        action="store_true",
-        help="operate on repositories in alphabetical order",
+        dest="order",
+        action="store_const",
+        const="alphabetical",
+        default=None,
+        help="Operate on repositories in alphabetical order",
     )
 
-    parser.add_argument(
-        "-a",
-        "--absolute",
-        action="store_true",
-        help="make repository paths absolute before operating on them",
+    args = parser.parse_args(argv)
+
+    verbosity: int = args.verbose - args.quiet
+    log_tracebacks: bool = (
+        args.tracebacks if args.tracebacks is not None else (verbosity >= 2)
     )
 
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        action="count",
-        default=0,
-        help="increase the verbosity of the script",
+    return Settings(
+        directories=tuple(args.directories),
+        exclude=tuple(args.exclude) if args.exclude else (),
+        depth=args.depth,
+        verbosity=verbosity,
+        absolute=bool(args.absolute),
+        follow=bool(args.follow),
+        lprune=bool(args.lprune),
+        print=bool(args.print),
+        recurse=bool(args.recurse_repositories),
+        single_thread=bool(args.single_thread) or bool(args.slow),
+        search_hidden=(args.everywhere >= 1),
+        search_caches=(args.everywhere >= 2),
+        slow=bool(args.slow),
+        log_tracebacks=log_tracebacks,
+        order=args.order,
     )
 
-    parser.add_argument(
-        "-q",
-        "--quiet",
-        action="count",
-        default=0,
-        help="decrease the verbosity of the script",
-    )
 
-    traceback_group = parser.add_mutually_exclusive_group()
-    traceback_group.add_argument(
-        "-t",
-        "--traceback",
-        action="store_true",
-        help="display tracebacks on error (defaults to True when verbosity >= 2)",
-    )
-    traceback_group.add_argument(
-        "-T",
-        "--no-traceback",
-        action="store_true",
-        help="disable tracebacks (even when verbosity >= 2)",
-    )
-
-    return parser.parse_args(argv)
-
-
-def setup_logging(quiet: int, verbose: int, tracebacks: bool | None) -> None:
-    volume = verbose - quiet
-
-    # if volume <= -2:
-    #     level = logging.FATAL
-    # elif volume <= -1:
-    #     level = logging.CRITICAL
-    # elif volume <= 0:
-    #     level = logging.WARNING
-    # elif volume <= 1:
-    #     level = logging.INFO
-    # elif volume <= 2:
-    #     level = logging.DEBUG
-
-    level = logging.WARNING - (volume * 10)
+def setup_logging(settings: Settings) -> None:
+    level = logging.WARNING - (settings.verbosity * 10)
     level = min(max(logging.DEBUG, level), logging.FATAL)
-
-    filters = []
-    if tracebacks is False:
-        filters.append(no_traceback_log_filter)
-    elif tracebacks is None and volume <= 1:
-        filters.append(no_traceback_log_filter)
 
     logging.config.dictConfig(
         {
@@ -603,7 +726,7 @@ def setup_logging(quiet: int, verbose: int, tracebacks: bool | None) -> None:
             "disable_existing_loggers": False,
             "formatters": {
                 "standard": {
-                    "format": "[%(levelname)8s %(asctime)s] %(repo_dir)s: %(message)s",
+                    "format": "[%(levelname)8s %(asctime)s %(name)s] %(repo_dir)s: %(message)s",
                     "datefmt": "%Y-%m-%d %H:%M:%S",
                 },
             },
@@ -613,42 +736,49 @@ def setup_logging(quiet: int, verbose: int, tracebacks: bool | None) -> None:
                     "var": REPO_DIR,
                     "attribute": "repo_dir",
                 },
+                "no_tracebacks": {
+                    "()": NoTracebackLogFilter,
+                },
             },
             "handlers": {
                 "console": {
                     "formatter": "standard",
-                    "filters": ["repo_dir_context"] + filters,
+                    "filters": ["repo_dir_context"]
+                    + ([] if settings.log_tracebacks else ["no_tracebacks"]),
                     "class": "logging.StreamHandler",
                 },
             },
-            "loggers": {
-                "update-repos": {
-                    "handlers": ["console"],
-                    "level": level,
-                    "propagate": False,
-                },
+            "root": {
+                "handlers": ["console"],
+                "level": level,
             },
         }
     )
 
+    # if log_tracebacks is False or (log_tracebacks is None and volume <= 1):
+    #     logger.addFilter(NoTracebackLogFilter())
 
-def collect_repos(args: argparse.Namespace) -> Generator[Repo]:
-    if args.random_order:
-        args.random_order = False
-        repos = list(collect_repos(args))
+
+def collect_repos(settings: Settings) -> Generator[Repo]:
+    if settings.order == "random":
+        settings = copy.replace(settings, order=None)
+        repos = list(collect_repos(settings))
         random.shuffle(repos)
         yield from repos
         return
 
     seen: set[Repo] = set()
-    for directory in args.directories:
+    for directory in settings.directories:
         for repo in Repo.find_recursive(
             starting_path=directory,
-            max_depth=args.depth,
-            exclude=args.exclude,
+            max_depth=settings.depth,
+            exclude=settings.exclude,
             include_ancestors=True,
-            force_recurse=args.force_recurse,
-            absolute_paths=args.absolute,
+            recurse_repositories=settings.recurse,
+            absolute_paths=settings.absolute,
+            follow_symlinks=settings.follow,
+            search_hidden=settings.search_hidden,
+            search_caches=settings.search_caches,
         ):
             if repo in seen:
                 continue
@@ -656,7 +786,7 @@ def collect_repos(args: argparse.Namespace) -> Generator[Repo]:
             yield repo
 
 
-def _single_threaded_main(args: argparse.Namespace) -> bool:
+def _single_threaded_main(settings: Settings) -> bool:
     """
     Update git repositories from remotes, one at a time.
     Returns a boolean indicating whether errors occurred.
@@ -664,13 +794,10 @@ def _single_threaded_main(args: argparse.Namespace) -> bool:
 
     any_errors = False
 
-    if args.print:
-        for repo in collect_repos(args):
-            print(repo.orig_path)
-        return any_errors
-
-    def process(func: Callable[P, bool], *func_args: P.args, **func_kwargs: P.kwargs):
-        if args.slow:
+    def process[**P](
+        func: Callable[P, bool], *func_args: P.args, **func_kwargs: P.kwargs
+    ):
+        if settings.slow:
             time.sleep(1)
         try:
             return func(*func_args, **func_kwargs)
@@ -679,27 +806,27 @@ def _single_threaded_main(args: argparse.Namespace) -> bool:
             return True
 
     linked_worktrees: list[Repo] = []
-    for repo in collect_repos(args):
+    for repo in collect_repos(settings):
         if not repo.is_main_worktree:
             linked_worktrees.append(repo)
             continue
-        any_errors |= process(repo.update, lprune=args.lprune)
+        any_errors |= process(repo.update, lprune=settings.lprune)
 
     for repo in linked_worktrees:
-        any_errors |= process(repo.update, lprune=args.lprune)
+        any_errors |= process(repo.update, lprune=settings.lprune)
 
     return any_errors
 
 
-def _multi_threaded_main(args: argparse.Namespace) -> bool:
+def _multi_threaded_main(settings: Settings) -> bool:
     """update git repositories from remotes in parallel."""
     any_errors = False
     linked_worktrees = []
 
     with MyExecutor() as executor:
-        for repo in collect_repos(args):
+        for repo in collect_repos(settings):
             if repo.is_main_worktree:
-                executor.submit(repo.update, lprune=args.lprune)
+                executor.submit(repo.update, lprune=settings.lprune)
             else:
                 linked_worktrees.append(repo)
 
@@ -723,18 +850,21 @@ def _multi_threaded_main(args: argparse.Namespace) -> bool:
 def main(argv: Sequence[str] | None = None) -> None:
     """Update git repositories from remotes."""
 
-    args = parse_arguments(argv)
-    setup_logging(args.quiet, args.verbose, args.traceback)
+    settings = parse_arguments(argv)
+    setup_logging(settings)
 
-    logger.debug("Args: %r", args)
-
-    os.environ["GIT_ASKPASS"] = "echo"
+    logger.debug("Settings: %r", settings)
 
     try:
-        if args.single_thread or args.print or args.slow:
-            failures = _single_threaded_main(args)
+        if settings.print:
+            for repo in collect_repos(settings):
+                print(repo.orig_path)
+            exit(0)
+
+        if settings.single_thread:
+            failures = _single_threaded_main(settings)
         else:
-            failures = _multi_threaded_main(args)
+            failures = _multi_threaded_main(settings)
     except KeyboardInterrupt:
         logger.fatal("Caught interrupt")
         exit(1)
