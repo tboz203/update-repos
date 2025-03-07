@@ -1,4 +1,4 @@
-#!/home/th026106/.pyenv/versions/update-repos/bin/python
+#!/usr/bin/env python
 """Update git repositories from remotes."""
 
 from __future__ import annotations
