@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import fnmatch
 import logging
 import logging.config
@@ -74,12 +73,16 @@ class Settings:
 class ContextAddedLogFilter(logging.Filter):
     """A logging filter that populates a LogRecord attribute from a ContextVar."""
 
-    def __init__(self, *, var: ContextVar, attribute: str):
+    def __init__(self, *, var: ContextVar, attribute: str, format: str | None = None):
         self.var = var
         self.attribute = attribute
+        self.format = format
 
     def filter(self, record: logging.LogRecord) -> bool:
-        setattr(record, self.attribute, self.var.get())
+        value = self.var.get()
+        if self.format:
+            value = self.format % value if value else ""
+        setattr(record, self.attribute, value)
         return True
 
 
@@ -101,9 +104,7 @@ class MyExecutor(ThreadPoolExecutor):
         super().__init__(*args, **kwargs)
         self._futures = []
 
-    def submit[**P, T](
-        self, fn: Callable[P, T], *args: P.args, **kwargs: P.kwargs
-    ) -> Future[T]:
+    def submit[**P, T](self, fn: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> Future[T]:
         ftr = super().submit(fn, *args, **kwargs)
         self._futures.append(ftr)
         return ftr
@@ -138,50 +139,44 @@ class Repo(git.Repo):
         """
         Enumerate Git Repositories.
 
-        Search first in and beneath the given `path` (optionally limited to a
-        maximum depth), and then optionally also upwards through the path's
-        ancestors. Skip searching paths matching optional wildcard exclusion
-        patterns. Do not recurse into found repositories unless
-        `recurse_repositories` is True. Build enumerated repositories from
-        relative paths unless `absolute_paths` is True.
+        Search first upwards through the path's ancestors (unless
+        `include_ancestors` is False), and then beneath the given `path`
+        (optionally limited to a maximum depth). Skip searching paths matching
+        optional wildcard exclusion patterns. Do not recurse into found
+        repositories unless `recurse_repositories` is True. Build enumerated
+        repositories from relative paths unless `absolute_paths` is True.
         """
 
         starting_path = Path(starting_path)
         if absolute_paths:
             starting_path = starting_path.resolve()
 
-        logger.debug(
-            "%s: finding git repositories: (maxdepth=%s)", starting_path, max_depth
-        )
+        logger.debug("%s: finding git repositories: (maxdepth=%s)", starting_path, max_depth)
 
-        walk_generator = depthwalk(
-            starting_path, max_depth=max_depth, follow_symlinks=follow_symlinks
-        )
+        walk_generator = depthwalk(starting_path, max_depth=max_depth, follow_symlinks=follow_symlinks)
         if include_ancestors:
-            walk_generator = chain(walk_generator, backwalk(starting_path))
+            walk_generator = chain(backwalk(starting_path), walk_generator)
 
         exclude = tuple(exclude) if exclude else ()
         exclude += () if search_hidden else (".*",)
         exclusion_patterns = cls._build_exclusion_patterns(exclude)
 
-        def should_exclude(
-            path: str | Path, dirs: Iterable[str | Path], files: Iterable[str | Path]
-        ) -> bool:
+        def should_exclude(path: str | Path) -> bool:
             """Test whether or not the current path should be excluded from the walk."""
 
-            del dirs, files
-
-            if any(fnmatch.fnmatch(str(path), pat) for pat in exclusion_patterns):
+            hits = [pat for pat in exclusion_patterns if fnmatch.fnmatch(str(path), pat)]
+            if hits:
+                logger.debug("Path matches exclusion pattern %s: %s", hits, path)
                 return True
 
             if not search_caches and is_cache(path):
+                logger.debug("Path is cache: %s", path)
                 return True
 
             return False
 
         for path, dirs, files in walk_generator:
-            if should_exclude(path, dirs, files):
-                logger.debug("Excluding path: %s", path)
+            if should_exclude(path):
                 # clearing `dirs` prevents `os.walk` (and hence `depthwalk`)
                 # from traversing any deeper, but doesn't affect `backwalk`
                 dirs.clear()
@@ -225,7 +220,7 @@ class Repo(git.Repo):
 
     def update(self, *, lprune: bool = False) -> bool:
         with context(REPO_DIR, self.orig_path):
-            logger.info("Updating repository")
+            logger.debug("Updating repository")
             failures = False
             if self.is_main_worktree:
                 failures |= self.update_remotes()
@@ -341,9 +336,7 @@ class Repo(git.Repo):
                     logger.info("skipping branch checked out elsewhere: %s", branch)
                 elif self.is_dirty():
                     failure = True
-                    logger.warning(
-                        "Refusing to update dirty checked out branch: %s", branch
-                    )
+                    logger.warning("Refusing to update dirty checked out branch: %s", branch)
                 else:
                     logger.debug("fast-forwarding checked out branch: %s", branch)
                     self.head.reset(tracking_branch, index=True, working_tree=True)
@@ -408,9 +401,7 @@ class Repo(git.Repo):
                 worktrees.append(worktree)
 
         if self not in worktrees:
-            raise RuntimeError(
-                "Own worktree not found in worktrees list", self, porcelain
-            )
+            raise RuntimeError("Own worktree not found in worktrees list", self, porcelain)
 
         for worktree in worktrees:
             worktree.worktrees = worktrees
@@ -420,9 +411,7 @@ class Repo(git.Repo):
     @worktrees.setter
     def worktrees(self, worktrees: list[Self]):
         if self not in worktrees:
-            raise ValueError(
-                "Repo must be among its own sibling worktrees", self, worktrees
-            )
+            raise ValueError("Repo must be among its own sibling worktrees", self, worktrees)
         self._worktrees = list(worktrees)
 
     @property
@@ -450,11 +439,7 @@ class Repo(git.Repo):
             result = f"({remote_ref}) {result}"
         if fetchinfo.flags & (git.FetchInfo.FORCED_UPDATE | git.FetchInfo.FAST_FORWARD):
             result = f"{result} <- {fetchinfo.old_commit}"
-        flag_list = [
-            flag_name
-            for flag, flag_name in FETCHINFO_FLAGS.items()
-            if flag & fetchinfo.flags
-        ]
+        flag_list = [flag_name for flag, flag_name in FETCHINFO_FLAGS.items() if flag & fetchinfo.flags]
         flags = " | ".join(flag_list)
         result = f"{result} ({flags})"
         return result
@@ -469,11 +454,7 @@ class Repo(git.Repo):
     ) -> str:
         # remove boring items
         if not show_all:
-            fetchinfolist = [
-                item
-                for item in fetchinfolist
-                if item.flags ^ git.FetchInfo.HEAD_UPTODATE
-            ]
+            fetchinfolist = [item for item in fetchinfolist if item.flags ^ git.FetchInfo.HEAD_UPTODATE]
         # short-circuit for boring lists
         if not fetchinfolist:
             return "[]"
@@ -495,9 +476,7 @@ def depthwalk(
 ) -> Generator[WalkEntry[Path]]:
     """just like `os.walk`, but with new added `maxdepth` parameter!"""
     starting_path = Path(starting_path)
-    walk_generator = starting_path.walk(
-        top_down=top_down, on_error=onerror, follow_symlinks=follow_symlinks
-    )
+    walk_generator = starting_path.walk(top_down=top_down, on_error=onerror, follow_symlinks=follow_symlinks)
     if max_depth is None:
         yield from walk_generator
         return
@@ -515,7 +494,7 @@ def depthwalk(
 
 def backwalk(starting_path: str | Path) -> Generator[WalkEntry[Path]]:
     """similar to `os.walk`, but goes up instead of down"""
-    for path in Path(starting_path).parents:
+    for path in Path(starting_path).resolve().parents:
         dirs, files = [], []
         for item in path.iterdir():
             place = dirs if item.is_dir() else files
@@ -633,7 +612,7 @@ def parse_arguments(argv: Sequence[str] | None) -> Settings:
         "-s",
         "--slow",
         action=argparse.BooleanOptionalAction,
-        help="Try to avoid ratelimit. Implies `--single-thread`",
+        help="Try to avoid ratelimit.",
     )
     parser.add_argument(
         "-a",
@@ -693,9 +672,7 @@ def parse_arguments(argv: Sequence[str] | None) -> Settings:
     args = parser.parse_args(argv)
 
     verbosity: int = args.verbose - args.quiet
-    log_tracebacks: bool = (
-        args.tracebacks if args.tracebacks is not None else (verbosity >= 2)
-    )
+    log_tracebacks: bool = args.tracebacks if args.tracebacks is not None else (verbosity >= 2)
 
     return Settings(
         directories=tuple(args.directories),
@@ -707,7 +684,7 @@ def parse_arguments(argv: Sequence[str] | None) -> Settings:
         lprune=bool(args.lprune),
         print=bool(args.print),
         recurse=bool(args.recurse_repositories),
-        single_thread=bool(args.single_thread) or bool(args.slow),
+        single_thread=bool(args.single_thread),
         search_hidden=(args.everywhere >= 1),
         search_caches=(args.everywhere >= 2),
         slow=bool(args.slow),
@@ -726,7 +703,11 @@ def setup_logging(settings: Settings) -> None:
             "disable_existing_loggers": False,
             "formatters": {
                 "standard": {
-                    "format": "[%(levelname)8s %(asctime)s %(name)s] %(repo_dir)s: %(message)s",
+                    "format": "[%(levelname)8s %(asctime)s %(name)s] %(message)s",
+                    "datefmt": "%Y-%m-%d %H:%M:%S",
+                },
+                "with_repo": {
+                    "format": "[%(levelname)8s %(asctime)s %(name)s]%(repo_dir)s %(message)s",
                     "datefmt": "%Y-%m-%d %H:%M:%S",
                 },
             },
@@ -735,6 +716,7 @@ def setup_logging(settings: Settings) -> None:
                     "()": ContextAddedLogFilter,
                     "var": REPO_DIR,
                     "attribute": "repo_dir",
+                    "format": " %s:",
                 },
                 "no_tracebacks": {
                     "()": NoTracebackLogFilter,
@@ -742,9 +724,8 @@ def setup_logging(settings: Settings) -> None:
             },
             "handlers": {
                 "console": {
-                    "formatter": "standard",
-                    "filters": ["repo_dir_context"]
-                    + ([] if settings.log_tracebacks else ["no_tracebacks"]),
+                    "formatter": "with_repo",
+                    "filters": ["repo_dir_context"] + ([] if settings.log_tracebacks else ["no_tracebacks"]),
                     "class": "logging.StreamHandler",
                 },
             },
@@ -759,31 +740,32 @@ def setup_logging(settings: Settings) -> None:
     #     logger.addFilter(NoTracebackLogFilter())
 
 
-def collect_repos(settings: Settings) -> Generator[Repo]:
-    if settings.order == "random":
-        settings = copy.replace(settings, order=None)
-        repos = list(collect_repos(settings))
-        random.shuffle(repos)
-        yield from repos
-        return
-
-    seen: set[Repo] = set()
+def collect_repos(settings: Settings) -> list[Repo]:
+    repo_set: set[Repo] = set()
     for directory in settings.directories:
-        for repo in Repo.find_recursive(
-            starting_path=directory,
-            max_depth=settings.depth,
-            exclude=settings.exclude,
-            include_ancestors=True,
-            recurse_repositories=settings.recurse,
-            absolute_paths=settings.absolute,
-            follow_symlinks=settings.follow,
-            search_hidden=settings.search_hidden,
-            search_caches=settings.search_caches,
-        ):
-            if repo in seen:
-                continue
-            seen.add(repo)
-            yield repo
+        repo_set.update(
+            Repo.find_recursive(
+                starting_path=directory,
+                max_depth=settings.depth,
+                exclude=settings.exclude,
+                include_ancestors=True,
+                recurse_repositories=settings.recurse,
+                absolute_paths=settings.absolute,
+                follow_symlinks=settings.follow,
+                search_hidden=settings.search_hidden,
+                search_caches=settings.search_caches,
+            )
+        )
+
+    repo_list = list(repo_set)
+
+    if settings.order == "random":
+        random.shuffle(repo_list)
+    else:
+        repo_list.sort(key=lambda r: r.orig_path)
+
+    logger.info("Found %d repositories", len(repo_list))
+    return repo_list
 
 
 def _single_threaded_main(settings: Settings) -> bool:
@@ -794,9 +776,7 @@ def _single_threaded_main(settings: Settings) -> bool:
 
     any_errors = False
 
-    def process[**P](
-        func: Callable[P, bool], *func_args: P.args, **func_kwargs: P.kwargs
-    ):
+    def process[**P](func: Callable[P, bool], *func_args: P.args, **func_kwargs: P.kwargs):
         if settings.slow:
             time.sleep(1)
         try:
@@ -823,10 +803,15 @@ def _multi_threaded_main(settings: Settings) -> bool:
     any_errors = False
     linked_worktrees = []
 
-    with MyExecutor() as executor:
+    def process(repo, *args, **kwargs):
+        if settings.slow:
+            time.sleep(1)
+        return repo.update(*args, **kwargs)
+
+    with MyExecutor(4) as executor:
         for repo in collect_repos(settings):
             if repo.is_main_worktree:
-                executor.submit(repo.update, lprune=settings.lprune)
+                executor.submit(process, repo, lprune=settings.lprune)
             else:
                 linked_worktrees.append(repo)
 
