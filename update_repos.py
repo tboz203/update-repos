@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env uv-run-in-project
 """Update git repositories from remotes."""
 
 from __future__ import annotations
